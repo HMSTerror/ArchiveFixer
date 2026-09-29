@@ -1,5 +1,7 @@
 # ArchiveFixer
 
+> 版本提示：v0.0.2 的 EXE 仅支持 7-Zip。当前 `main` 源码已加入 WinRAR、Bandizip 和 `.zip` 改名选项；这些功能需要下载 v0.0.3 或更新版本的 EXE。v0.0.3 发布前可从源码运行。
+
 下载的压缩包有时会被改名成 `example.7zshan`、`example.shan7z`，或拆成 `.001`、`.002` 等分卷。反复改名、解压和输入密码很麻烦，所以做了这个工具。
 
 目前支持 Windows，可调用本机安装的 7-Zip、WinRAR 或 Bandizip 解压。
