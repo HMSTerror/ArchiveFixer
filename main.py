@@ -20,9 +20,10 @@ def smoke_test() -> None:
                 raise RuntimeError("Archive deletion should be opt in")
             source = Path(temporary) / "demo.shan7z"
             source.write_bytes(b"sample")
+            app.rename_suffix.set(".zip")
             app._add_paths([source])
             app._rename(list(app.rows))
-            if not (Path(temporary) / "demo.7z").is_file() or source.exists():
+            if not (Path(temporary) / "demo.zip").is_file() or source.exists():
                 raise RuntimeError("Rename smoke test failed")
         finally:
             root.destroy()

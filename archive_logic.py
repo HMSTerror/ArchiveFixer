@@ -10,6 +10,7 @@ import re
 VOLUME_RE = re.compile(r"\.(0[0-9]{3}|[0-9]{3})(?![0-9])")
 ARCHIVE_SUFFIXES = frozenset({".7z", ".shan7z", ".7shanz", ".7zshan", ".zip", ".rar", ".tar", ".gz", ".bz2", ".xz", ".cab", ".iso", ".wim"})
 DISGUISED_SEVEN_ZIP_SUFFIXES = frozenset({".shan7z", ".7shanz", ".7zshan"})
+RENAME_SUFFIXES = frozenset({".7z", ".zip"})
 
 
 @dataclass(frozen=True)
@@ -29,26 +30,28 @@ def volume_part(name: str) -> tuple[int, int] | None:
     return match.end(), int(match.group(1))
 
 
-def target_name(name: str) -> str:
-    """Keep volume numbering or normalize a disguised 7z suffix."""
+def target_name(name: str, target_suffix: str = ".7z") -> str:
+    """Keep volume numbering or replace the archive suffix selected by the user."""
+    if target_suffix not in RENAME_SUFFIXES:
+        raise ValueError(f"不支持的目标后缀：{target_suffix}")
     part = volume_part(name)
     if part:
         return name[: part[0]]
     suffix = Path(name).suffix
     if suffix.casefold() in DISGUISED_SEVEN_ZIP_SUFFIXES:
-        return name[: -len(suffix)] + ".7z"
-    existing_7z = re.search(r"(?i)\.7z(?=\.|$)", name)
-    if existing_7z:
-        return name[: existing_7z.end()]
-    if suffix.casefold() == ".7z":
-        return name
+        return name[: -len(suffix)] + target_suffix
+    if suffix.casefold() in RENAME_SUFFIXES:
+        return name[: -len(suffix)] + target_suffix
+    existing_archive = re.search(r"(?i)\.(?:7z|zip)(?=\.|$)", name)
+    if existing_archive:
+        return name[: existing_archive.start()] + target_suffix
     if suffix:
-        return name[: -len(suffix)] + ".7z"
-    return name + ".7z"
+        return name[: -len(suffix)] + target_suffix
+    return name + target_suffix
 
 
-def plan_renames(paths: list[Path]) -> list[RenameDecision]:
-    targets = [path.with_name(target_name(path.name)) for path in paths]
+def plan_renames(paths: list[Path], target_suffix: str = ".7z") -> list[RenameDecision]:
+    targets = [path.with_name(target_name(path.name, target_suffix)) for path in paths]
     counts: dict[str, int] = {}
     for target in targets:
         key = str(target).casefold()

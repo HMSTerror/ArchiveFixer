@@ -1,17 +1,16 @@
-"""Tkinter GUI for previewing archive renames and extracting with local 7-Zip."""
+"""Tkinter GUI for archive renaming and extraction with installed tools."""
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from queue import Empty, Queue
-import shutil
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
+from archive_extractors import EXTRACTOR_LABELS, find_extractor
 from archive_engine import (
     CleanupError,
     ExtractionEngine,
@@ -26,31 +25,11 @@ from password_store import default_store_path, load_password_presets, save_passw
 
 
 DEFAULT_PASSWORD = ""
+BACKEND_BY_LABEL = {label: kind for kind, label in EXTRACTOR_LABELS.items()}
 
 
 def find_7zip() -> Path | None:
-    candidates = [shutil.which("7z"), shutil.which("7za")]
-    for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
-        root = os.environ.get(env_name)
-        if root:
-            candidates.append(str(Path(root) / "7-Zip" / "7z.exe"))
-    try:
-        import winreg
-
-        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            for key_name in (r"SOFTWARE\7-Zip", r"SOFTWARE\WOW6432Node\7-Zip"):
-                try:
-                    with winreg.OpenKey(hive, key_name) as key:
-                        install_dir, _ = winreg.QueryValueEx(key, "Path")
-                        candidates.append(str(Path(install_dir) / "7z.exe"))
-                except OSError:
-                    pass
-    except ImportError:
-        pass
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return Path(candidate)
-    return None
+    return find_extractor("7zip")
 
 
 class ArchiveApp:
@@ -65,7 +44,11 @@ class ArchiveApp:
         self.busy = False
         self.preset_path = preset_path or default_store_path()
 
-        self.seven_zip = tk.StringVar(value=str(find_7zip() or ""))
+        self.extractor_paths = {kind: str(find_extractor(kind) or "") for kind in EXTRACTOR_LABELS}
+        self.active_backend = next((kind for kind, path in self.extractor_paths.items() if path), "7zip")
+        self.extractor_choice = tk.StringVar(value=EXTRACTOR_LABELS[self.active_backend])
+        self.extractor_path = tk.StringVar(value=self.extractor_paths[self.active_backend])
+        self.rename_suffix = tk.StringVar(value=".7z")
         self.password_vars = [tk.StringVar(value=value) for value in load_password_presets(self.preset_path, DEFAULT_PASSWORD)]
         self.password = self.password_vars[0]
         self.output_dir = tk.StringVar()
@@ -89,7 +72,7 @@ class ArchiveApp:
         title.grid(row=0, column=0, sticky="w", pady=(0, 8))
         ttk.Label(
             outer,
-            text="普通文件：改为 .7z（已有 .7z 时去掉后续伪装）；分卷文件：保留 .001 / .002 等三位编号，删除其后的伪装后缀。",
+            text="普通文件：按所选后缀改名（仅改文件名，不转换压缩格式）；分卷文件：保留 .001 / .002 等编号，删除其后的伪装后缀。",
             wraplength=1000,
         ).grid(row=1, column=0, sticky="ew", pady=(0, 10))
 
@@ -107,6 +90,10 @@ class ArchiveApp:
         add_folder_button = ttk.Button(buttons, text="添加文件夹", command=self._add_folder)
         add_folder_button.pack(side="left", padx=(0, 6))
         self.file_buttons.append(add_folder_button)
+        ttk.Label(buttons, text="改名后缀").pack(side="left", padx=(8, 4))
+        suffix_picker = ttk.Combobox(buttons, textvariable=self.rename_suffix, values=(".7z", ".zip"), state="readonly", width=6)
+        suffix_picker.pack(side="left", padx=(0, 12))
+        suffix_picker.bind("<<ComboboxSelected>>", lambda event: self._refresh_preview())
         ttk.Checkbutton(buttons, text="包含子文件夹", variable=self.recursive).pack(side="left", padx=(0, 15))
         for label, command in (("全选", self._select_all), ("移除所选", self._remove_selected), ("清空列表", self._clear)):
             button = ttk.Button(buttons, text=label, command=command)
@@ -147,9 +134,18 @@ class ArchiveApp:
         settings = ttk.LabelFrame(outer, text="解压设置", padding=8)
         settings.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         settings.columnconfigure(1, weight=1)
-        ttk.Label(settings, text="7-Zip 程序").grid(row=0, column=0, sticky="w")
-        ttk.Entry(settings, textvariable=self.seven_zip).grid(row=0, column=1, sticky="ew", padx=8, pady=3)
-        ttk.Button(settings, text="浏览", command=self._browse_7zip).grid(row=0, column=2)
+        ttk.Label(settings, text="解压程序").grid(row=0, column=0, sticky="w")
+        extractor_row = ttk.Frame(settings)
+        extractor_row.grid(row=0, column=1, sticky="ew", padx=8, pady=3)
+        extractor_row.columnconfigure(1, weight=1)
+        extractor_picker = ttk.Combobox(
+            extractor_row, textvariable=self.extractor_choice,
+            values=tuple(EXTRACTOR_LABELS.values()), state="readonly", width=12,
+        )
+        extractor_picker.grid(row=0, column=0, padx=(0, 8))
+        extractor_picker.bind("<<ComboboxSelected>>", self._on_extractor_change)
+        ttk.Entry(extractor_row, textvariable=self.extractor_path).grid(row=0, column=1, sticky="ew")
+        ttk.Button(settings, text="浏览", command=self._browse_extractor).grid(row=0, column=2)
         ttk.Label(settings, text="密码预设（依次尝试）").grid(row=1, column=0, sticky="w")
         password_panel = ttk.Frame(settings)
         password_panel.grid(row=1, column=1, columnspan=2, sticky="w", padx=8, pady=3)
@@ -273,7 +269,7 @@ class ArchiveApp:
 
     def _refresh_preview(self) -> None:
         file_iids = [iid for iid in self.rows if iid not in self.folder_archives]
-        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids])))
+        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
         for iid, path in self.rows.items():
             if iid in self.folder_archives:
                 count = len(self.folder_archives[iid])
@@ -306,10 +302,19 @@ class ArchiveApp:
         self.folder_archives.clear()
         self.status.set("列表已清空。")
 
-    def _browse_7zip(self) -> None:
-        selected = filedialog.askopenfilename(title="选择 7z.exe", filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")])
+    def _on_extractor_change(self, event: tk.Event | None = None) -> None:
+        self.extractor_paths[self.active_backend] = self.extractor_path.get()
+        self.active_backend = BACKEND_BY_LABEL[self.extractor_choice.get()]
+        self.extractor_path.set(self.extractor_paths[self.active_backend])
+
+    def _browse_extractor(self) -> None:
+        label = self.extractor_choice.get()
+        selected = filedialog.askopenfilename(
+            title=f"选择 {label} 的命令行程序",
+            filetypes=[("可执行文件", "*.exe"), ("所有文件", "*.*")],
+        )
         if selected:
-            self.seven_zip.set(selected)
+            self.extractor_path.set(selected)
 
     def _browse_output(self) -> None:
         selected = filedialog.askdirectory(title="选择解压目标目录")
@@ -330,7 +335,7 @@ class ArchiveApp:
 
     def _rename(self, selected: list[str]) -> tuple[list[str], int]:
         file_iids = [iid for iid in self.rows if iid not in self.folder_archives]
-        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids])))
+        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
         ready = []
         renamed = skipped = 0
         for iid in selected:
@@ -407,15 +412,25 @@ class ArchiveApp:
             self._log(message)
             self.status.set(message)
 
-    def _resolve_7zip(self) -> Path | None:
-        executable = Path(self.seven_zip.get().strip().strip('"'))
-        if not executable.is_file():
-            messagebox.showerror("找不到 7-Zip", "请在“7-Zip 程序”中选择本机的 7z.exe。")
+    def _resolve_extractor(self) -> tuple[Path, str] | None:
+        label = self.extractor_choice.get()
+        backend = BACKEND_BY_LABEL.get(label)
+        if backend is None:
+            messagebox.showerror("解压程序无效", f"不支持的解压程序：{label}")
             return None
-        return executable
+        executable = Path(self.extractor_path.get().strip().strip('"'))
+        if not executable.is_file():
+            names = {"7zip": "7z.exe", "winrar": "Rar.exe", "bandizip": "bz.exe"}
+            messagebox.showerror("找不到解压程序", f"请安装 {label}，并选择本机的 {names[backend]}。")
+            return None
+        expected = {"7zip": {"7z.exe", "7za.exe"}, "winrar": {"rar.exe"}, "bandizip": {"bz.exe"}}
+        if executable.name.casefold() not in expected[backend]:
+            messagebox.showerror("程序类型不匹配", f"请选择 {label} 的命令行程序。")
+            return None
+        return executable, backend
 
     def _preflight_combined(self, selected: list[str]) -> bool:
-        if self._resolve_7zip() is None:
+        if self._resolve_extractor() is None:
             return False
         try:
             max_concurrent = self.concurrent.get()
@@ -430,7 +445,7 @@ class ArchiveApp:
             messagebox.showerror("目标目录无效", f"解压目标不是文件夹：{output_root}")
             return False
         file_iids = [iid for iid in self.rows if iid not in self.folder_archives]
-        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids])))
+        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
         for iid in selected:
             if iid in self.folder_archives:
                 continue
@@ -446,9 +461,10 @@ class ArchiveApp:
         return True
 
     def _start_extract(self, selected: list[str]) -> None:
-        executable = self._resolve_7zip()
-        if executable is None:
+        resolved = self._resolve_extractor()
+        if resolved is None:
             return
+        executable, backend = resolved
         output_text = self.output_dir.get().strip()
         output_root = Path(output_text).expanduser() if output_text else None
         try:
@@ -492,7 +508,7 @@ class ArchiveApp:
         passwords = tuple(variable.get() for variable in self.password_vars)
         thread = threading.Thread(
             target=self._extract_worker,
-            args=(executable, jobs, output_root, passwords, self.delete_archives.get(), max_concurrent),
+            args=(executable, backend, jobs, output_root, passwords, self.delete_archives.get(), max_concurrent),
             daemon=True,
         )
         thread.start()
@@ -500,13 +516,14 @@ class ArchiveApp:
     def _extract_worker(
         self,
         executable: Path,
+        backend: str,
         jobs: list[ExtractionJob],
         output_root: Path | None,
         passwords: tuple[str, ...],
         delete_archives: bool,
         max_concurrent: int,
     ) -> None:
-        engine = ExtractionEngine(executable, passwords, lambda message: self.events.put(("log", message)))
+        engine = ExtractionEngine(executable, passwords, lambda message: self.events.put(("log", message)), backend)
         try:
             result = engine.run(jobs, output_root, delete_archives, max_concurrent)
         except ExtractionError as exc:

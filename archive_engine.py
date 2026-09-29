@@ -14,6 +14,7 @@ import tempfile
 from typing import Callable, Sequence
 from uuid import uuid4
 
+from archive_extractors import EXTRACTOR_LABELS, extraction_command, output_encoding
 from archive_logic import volume_part
 
 
@@ -425,8 +426,17 @@ def _nested_candidates(destination: Path, log: Callable[[str], None] | None = No
 
 
 class ExtractionEngine:
-    def __init__(self, executable: Path, passwords: str | Sequence[str], log: Callable[[str], None]) -> None:
+    def __init__(
+        self,
+        executable: Path,
+        passwords: str | Sequence[str],
+        log: Callable[[str], None],
+        backend: str = "7zip",
+    ) -> None:
+        if backend not in EXTRACTOR_LABELS:
+            raise ValueError(f"不支持的解压程序：{backend}")
         self.executable = executable
+        self.backend = backend
         supplied = [passwords] if isinstance(passwords, str) else list(passwords)
         self.passwords = tuple(supplied) if any(supplied) else ("",)
         self.log = log
@@ -463,7 +473,7 @@ class ExtractionEngine:
         workdirs: dict[Path, Path] = {}
 
         def process_one(spec: ExtractionJob) -> JobResult:
-            worker = ExtractionEngine(self.executable, self.passwords, self.log)
+            worker = ExtractionEngine(self.executable, self.passwords, self.log, self.backend)
             parent = spec.source.parent if spec.folder_mode else (output_root or spec.source.parent)
             try:
                 parent.mkdir(parents=True, exist_ok=True)
@@ -798,11 +808,7 @@ class ExtractionEngine:
                 attempt = Path(tempfile.mkdtemp(prefix=".archive_attempt_", dir=parent))
             except OSError as exc:
                 raise ExtractionError(f"无法创建密码尝试目录：{parent}：{exc}") from exc
-            args = [
-                str(self.executable), "x", "-y", "-aos", "-bd", "-bb0",
-                "-bso0", "-bsp0", "-bse1", "-sccUTF-8",
-                f"-p{password if password else '-'}", f"-o{attempt}", str(source),
-            ]
+            args = extraction_command(self.backend, self.executable, source, attempt, password)
             self.log(f"第 {number} 层尝试预设密码 {index}/{len(self.passwords)}：{source.name}")
             try:
                 command = subprocess.run(
@@ -811,14 +817,14 @@ class ExtractionEngine:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    encoding="utf-8",
+                    encoding=output_encoding(self.backend),
                     errors="replace",
                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     check=False,
                 )
             except OSError as exc:
                 self._remove_attempt(attempt, parent)
-                raise ExtractionError(f"无法启动 7-Zip：{exc}") from exc
+                raise ExtractionError(f"无法启动 {EXTRACTOR_LABELS[self.backend]}：{exc}") from exc
             if command.returncode == 0:
                 try:
                     attempt.rename(destination)

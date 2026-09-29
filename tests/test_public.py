@@ -8,6 +8,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import Mock, patch
 
+from archive_extractors import extraction_command, find_extractor, output_encoding
 from archive_engine import (
     ExtractionEngine,
     ExtractionError,
@@ -47,6 +48,56 @@ class PublicReleaseTests(unittest.TestCase):
                     self.assertFalse(source.exists())
                     self.assertEqual((Path(temporary) / expected).read_bytes(), b"archive sample")
 
+    def test_zip_rename_choice_preserves_volume_numbers(self) -> None:
+        self.assertEqual(target_name("中文 文件.shan7z", ".zip"), "中文 文件.zip")
+        self.assertEqual(target_name("demo.7z.fake", ".zip"), "demo.zip")
+        self.assertEqual(target_name("demo.zip.fake", ".7z"), "demo.7z")
+        self.assertEqual(target_name("demo.7z.001删", ".zip"), "demo.7z.001")
+        self.assertEqual(target_name("name.zip.part.7shanz", ".zip"), "name.zip.part.zip")
+        with TemporaryDirectory() as temporary:
+            source = Path(temporary) / "demo.shan7z"
+            existing = Path(temporary) / "demo.zip"
+            source.write_bytes(b"source")
+            existing.write_bytes(b"existing")
+            self.assertEqual(plan_renames([source], ".zip")[0].status, "conflict")
+
+    def test_extractor_command_adapters(self) -> None:
+        source = Path("C:/input/中文 文件.zip")
+        destination = Path("C:/output folder")
+        seven_zip = extraction_command("7zip", Path("7z.exe"), source, destination, "secret")
+        self.assertIn("-psecret", seven_zip)
+        self.assertIn(f"-o{destination}", seven_zip)
+        self.assertEqual(seven_zip[-1], str(source))
+
+        winrar = extraction_command("winrar", Path("Rar.exe"), source, destination, "secret")
+        self.assertEqual(winrar[:4], ["Rar.exe", "x", "-y", "-o-"])
+        self.assertIn("-psecret", winrar)
+        self.assertEqual(winrar[-1], str(destination) + "\\")
+        self.assertIn("-p-", extraction_command("winrar", Path("Rar.exe"), source, destination, ""))
+
+        bandizip = extraction_command("bandizip", Path("bz.exe"), source, destination, "secret")
+        self.assertEqual(bandizip[:3], ["bz.exe", "x", "-y"])
+        self.assertIn("-consolemode:utf8", bandizip)
+        self.assertIn("-p:secret", bandizip)
+        self.assertIn(f"-o:{destination}", bandizip)
+        self.assertNotIn("-p:", extraction_command("bandizip", Path("bz.exe"), source, destination, ""))
+        self.assertEqual(output_encoding("bandizip"), "utf-8")
+
+    def test_find_winrar_and_bandizip_console_tools(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            winrar = root / "WinRAR" / "Rar.exe"
+            bandizip = root / "Bandizip" / "bz.exe"
+            winrar.parent.mkdir()
+            bandizip.parent.mkdir()
+            winrar.write_bytes(b"sample")
+            bandizip.write_bytes(b"sample")
+            with patch("archive_extractors.shutil.which", return_value=None), patch.dict(
+                "archive_extractors.os.environ", {"ProgramFiles": str(root)}, clear=True,
+            ):
+                self.assertEqual(find_extractor("winrar"), winrar)
+                self.assertEqual(find_extractor("bandizip"), bandizip)
+
     def test_digits_case_and_middle_text(self) -> None:
         cases = {
             "2026 demo.7ShAnZ": "2026 demo.7z",
@@ -76,6 +127,31 @@ class PublicReleaseTests(unittest.TestCase):
             try:
                 app = ArchiveApp(root, preset_path=Path(temporary) / "presets.json")
                 self.assertFalse(app.delete_archives.get())
+            finally:
+                root.destroy()
+
+    def test_gui_preview_uses_zip_rename_choice(self) -> None:
+        from archive_gui import ArchiveApp, TkinterDnD
+
+        with TemporaryDirectory() as temporary:
+            source = Path(temporary) / "中文 文件.shan7z"
+            source.write_bytes(b"dummy")
+            root = TkinterDnD.Tk()
+            root.withdraw()
+            try:
+                app = ArchiveApp(root, preset_path=Path(temporary) / "presets.json")
+                app._add_paths([source])
+                app.rename_suffix.set(".zip")
+                app._refresh_preview()
+                iid = next(iter(app.rows))
+                self.assertEqual(app.table.item(iid, "values")[1], "中文 文件.zip")
+                app.extractor_path.set("C:/custom/7z.exe")
+                app.extractor_choice.set("WinRAR")
+                app._on_extractor_change()
+                self.assertEqual(app.active_backend, "winrar")
+                app.extractor_choice.set("7-Zip")
+                app._on_extractor_change()
+                self.assertEqual(app.extractor_path.get(), "C:/custom/7z.exe")
             finally:
                 root.destroy()
 
@@ -119,6 +195,7 @@ class PublicReleaseTests(unittest.TestCase):
             app = ArchiveApp.__new__(ArchiveApp)
             app.rows = {"row": source}
             app.folder_archives = {}
+            app.rename_suffix = type("Value", (), {"get": lambda self: ".7z"})()
             app.status = type("Status", (), {"set": lambda self, value: None})()
             messages = []
             app._log = messages.append
@@ -141,6 +218,7 @@ class PublicReleaseTests(unittest.TestCase):
             app = ArchiveApp.__new__(ArchiveApp)
             app.rows = {"row": source}
             app.folder_archives = {}
+            app.rename_suffix = type("Value", (), {"get": lambda self: ".7z"})()
             app.status = type("Status", (), {"set": lambda self, value: None})()
             messages = []
             app._log = messages.append
@@ -156,7 +234,8 @@ class PublicReleaseTests(unittest.TestCase):
 
         app = ArchiveApp.__new__(ArchiveApp)
         app.busy = False
-        app.seven_zip = type("Value", (), {"get": lambda self: "missing-7z.exe"})()
+        app.extractor_choice = type("Value", (), {"get": lambda self: "7-Zip"})()
+        app.extractor_path = type("Value", (), {"get": lambda self: "missing-7z.exe"})()
         app._selected = lambda: ["row"]
         app._rename = Mock(return_value=(["row"], 0))
         app._start_extract = Mock()
@@ -177,7 +256,9 @@ class PublicReleaseTests(unittest.TestCase):
             (Path(temporary) / "demo_解压").mkdir()
             app = ArchiveApp.__new__(ArchiveApp)
             app.busy = False
-            app.seven_zip = type("Value", (), {"get": lambda self: str(seven_zip)})()
+            app.extractor_choice = type("Value", (), {"get": lambda self: "7-Zip"})()
+            app.extractor_path = type("Value", (), {"get": lambda self: str(seven_zip)})()
+            app.rename_suffix = type("Value", (), {"get": lambda self: ".7z"})()
             app.concurrent = type("Value", (), {"get": lambda self: 2})()
             app.output_dir = type("Value", (), {"get": lambda self: ""})()
             app.rows = {"row": source}
@@ -268,6 +349,35 @@ class PublicReleaseTests(unittest.TestCase):
             self.assertEqual(result.layers, 2)
             self.assertEqual((folder / "demo_解压" / "payload.txt").read_text(encoding="utf-8"), "finished")
             self.assertFalse(disguised.exists())
+
+    def test_zip_choice_extracts_real_zip_archive(self) -> None:
+        from archive_gui import find_7zip
+
+        seven_zip = find_7zip()
+        if seven_zip is None:
+            self.skipTest("7-Zip is not installed")
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "中文 文件.txt").write_text("zip payload", encoding="utf-8")
+            subprocess.run(
+                [str(seven_zip), "a", "-y", "-tzip", "demo.zip", "中文 文件.txt"],
+                cwd=folder,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            disguised = folder / "demo.7shanz"
+            (folder / "demo.zip").rename(disguised)
+            decision = plan_renames([disguised], ".zip")[0]
+            self.assertEqual(decision.status, "rename")
+            decision.source.rename(decision.target)
+            result = ExtractionEngine(seven_zip, "", lambda message: None).run(
+                [ExtractionJob(decision.target, extraction_base(decision.target))], None, False,
+                max_concurrent=1,
+            )
+            self.assertEqual(result.successful_jobs, 1)
+            self.assertEqual((folder / "demo_解压" / "中文 文件.txt").read_text(encoding="utf-8"), "zip payload")
+            self.assertTrue(decision.target.exists())
 
 
 if __name__ == "__main__":
