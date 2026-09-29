@@ -117,6 +117,11 @@ def _walk_error(error: OSError) -> None:
     raise ExtractionError(f"无法完整扫描解压目录：{error}") from error
 
 
+def is_linked_path(path: Path) -> bool:
+    """Treat Windows junctions like symbolic links when scanning user data."""
+    return path.is_symlink() or path.is_junction()
+
+
 def _is_terminal_container(path: Path) -> bool:
     return path.suffix.casefold() in TERMINAL_CONTAINER_SUFFIXES and not ARCHIVE_HINT.search(path.name)
 
@@ -144,9 +149,11 @@ def discover_archive_inputs(folder: Path, recursive: bool = True) -> list[Path]:
     """Find likely archives in a folder without changing any names or files.
 
     """
+    if is_linked_path(folder):
+        raise ExtractionError(f"拒绝扫描链接目录：{folder}")
     if recursive:
         try:
-            direct_files = [path for path in folder.iterdir() if path.is_file() and not path.is_symlink()]
+            direct_files = [path for path in folder.iterdir() if path.is_file() and not is_linked_path(path)]
         except OSError as exc:
             raise ExtractionError(f"无法扫描文件夹：{folder}：{exc}") from exc
         has_launcher = any(path.suffix.casefold() == ".exe" for path in direct_files)
@@ -159,14 +166,14 @@ def discover_archive_inputs(folder: Path, recursive: bool = True) -> list[Path]:
             return []
         files = []
         for root, dirs, names in os.walk(folder, onerror=_walk_error):
-            dirs[:] = [name for name in dirs if not (Path(root) / name).is_symlink()]
+            dirs[:] = [name for name in dirs if not is_linked_path(Path(root) / name)]
             files.extend(Path(root) / name for name in names)
     else:
         try:
             files = list(folder.iterdir())
         except OSError as exc:
             raise ExtractionError(f"无法扫描文件夹：{folder}：{exc}") from exc
-    files = [path for path in files if not path.is_symlink() and path.is_file()]
+    files = [path for path in files if not is_linked_path(path) and path.is_file()]
     found: set[Path] = set()
     for path in files:
         if _is_terminal_container(path) or _is_save_archive_path(path, folder):
@@ -191,7 +198,7 @@ def expand_dropped_folder(folder: Path, recursive: bool = True) -> list[Path]:
     except OSError as exc:
         raise ExtractionError(f"无法读取文件夹：{folder}：{exc}") from exc
     for child in children:
-        if child.is_dir() and not child.is_symlink() and discover_archive_inputs(child, recursive=recursive):
+        if child.is_dir() and not is_linked_path(child) and discover_archive_inputs(child, recursive=recursive):
             child_folders.append(child)
     if direct_archives and child_folders:
         return sorted(direct_archives + child_folders, key=lambda path: str(path).casefold())
@@ -202,7 +209,7 @@ def flatten_existing_result(root: Path) -> tuple[Path, int]:
     """Collapse a previous run's sole archive-wrapper chain into its result folder.
 
     """
-    if root.is_symlink() or not root.is_dir():
+    if is_linked_path(root) or not root.is_dir():
         raise ExtractionError("请选择已有的解压结果文件夹。")
     chain = [root]
     current = root
@@ -211,7 +218,7 @@ def flatten_existing_result(root: Path) -> tuple[Path, int]:
             entries = list(current.iterdir())
         except OSError as exc:
             raise ExtractionError(f"无法读取目录：{current}：{exc}") from exc
-        if len(entries) != 1 or entries[0].is_symlink() or not entries[0].is_dir():
+        if len(entries) != 1 or is_linked_path(entries[0]) or not entries[0].is_dir():
             break
         child = entries[0]
         archive_base = current.name[:-3] if current.name.endswith("_解压") else ""
@@ -259,10 +266,10 @@ def flatten_existing_result(root: Path) -> tuple[Path, int]:
         resolved_backup = backup.resolve(strict=True)
     except OSError as exc:
         raise CleanupError(f"结果已整理，但无法核对旧目录：{backup}：{exc}") from exc
-    if backup.is_symlink() or resolved_backup.parent != resolved_parent or not backup.name.startswith(".archive_flat_backup_"):
+    if is_linked_path(backup) or resolved_backup.parent != resolved_parent or not backup.name.startswith(".archive_flat_backup_"):
         raise CleanupError(f"结果已整理，但拒绝清理非预期旧目录：{backup}")
     for folder, dirs, files in os.walk(backup, onerror=_walk_error):
-        if files or any((Path(folder) / name).is_symlink() for name in dirs):
+        if files or any(is_linked_path(Path(folder) / name) for name in dirs):
             raise CleanupError(f"结果已整理，但旧目录中出现文件，已保留：{backup}")
     try:
         shutil.rmtree(backup)
@@ -290,7 +297,7 @@ def _volume_group(first: Path) -> list[Path]:
     for sibling in first.parent.iterdir():
         sibling_prefix = _volume_prefix(sibling)
         if (
-            sibling.is_symlink()
+            is_linked_path(sibling)
             or not sibling.is_file()
             or sibling_prefix is None
             or sibling_prefix.casefold() != prefix.casefold()
@@ -361,8 +368,8 @@ def _archive_files(path: Path) -> tuple[ArchiveSnapshot, ...]:
 def _nested_candidates(destination: Path, log: Callable[[str], None] | None = None) -> list[Path]:
     files: list[Path] = []
     for root, dirs, names in os.walk(destination, onerror=_walk_error):
-        dirs[:] = [name for name in dirs if not (Path(root) / name).is_symlink()]
-        files.extend(Path(root) / name for name in names if not (Path(root) / name).is_symlink())
+        dirs[:] = [name for name in dirs if not is_linked_path(Path(root) / name)]
+        files.extend(Path(root) / name for name in names if not is_linked_path(Path(root) / name))
     files.sort(key=lambda path: str(path).casefold())
     if any(path.suffix.casefold() == ".exe" for path in files):
         if log:
@@ -469,6 +476,11 @@ class ExtractionEngine:
             for file_spec in (spec for spec in specs if not spec.folder_mode):
                 if file_spec.source.is_relative_to(folder_spec.source):
                     raise ExtractionError(f"同一压缩包同时被单独选择和文件夹任务包含：{file_spec.source}")
+        folder_specs = [spec for spec in specs if spec.folder_mode]
+        for index, folder_spec in enumerate(folder_specs):
+            for other in folder_specs[index + 1:]:
+                if folder_spec.source.is_relative_to(other.source) or other.source.is_relative_to(folder_spec.source):
+                    raise ExtractionError(f"嵌套文件夹被重复选择：{folder_spec.source}；{other.source}")
         self.layers = []
         workdirs: dict[Path, Path] = {}
 
@@ -581,7 +593,7 @@ class ExtractionEngine:
                     entries = list(layer.destination.iterdir())
                 except OSError as exc:
                     raise ExtractionError(f"无法检查解压目录：{layer.destination}：{exc}") from exc
-                if len(entries) == 1 and entries[0].is_dir() and not entries[0].is_symlink():
+                if len(entries) == 1 and entries[0].is_dir() and not is_linked_path(entries[0]):
                     sole = entries[0]
                     if sole == child:
                         wrappers.add(sole)
@@ -589,7 +601,7 @@ class ExtractionEngine:
                         wrappers.add(sole)
             for folder, dirs, files in os.walk(root, onerror=_walk_error):
                 folder_path = Path(folder)
-                linked_dirs = [name for name in dirs if (folder_path / name).is_symlink()]
+                linked_dirs = [name for name in dirs if is_linked_path(folder_path / name)]
                 dirs[:] = [name for name in dirs if name not in linked_dirs]
                 for name in files + linked_dirs:
                     source = folder_path / name
@@ -634,7 +646,7 @@ class ExtractionEngine:
         for source, relative, _ in payload:
             destination = stage / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
-            if destination.exists() or destination.is_symlink():
+            if destination.exists() or is_linked_path(destination):
                 raise ExtractionError(f"整理后的目标已存在：{destination}")
             try:
                 source.replace(destination)
@@ -651,7 +663,7 @@ class ExtractionEngine:
                 stat = snapshot.path.stat()
             except OSError as exc:
                 raise ExtractionError(f"压缩包已变化，停止整理：{snapshot.path}：{exc}") from exc
-            if snapshot.path.is_symlink() or (stat.st_size, stat.st_mtime_ns) != (snapshot.size, snapshot.mtime_ns):
+            if is_linked_path(snapshot.path) or (stat.st_size, stat.st_mtime_ns) != (snapshot.size, snapshot.mtime_ns):
                 raise ExtractionError(f"压缩包在处理期间发生变化，停止整理：{snapshot.path}")
 
     @staticmethod
@@ -662,7 +674,7 @@ class ExtractionEngine:
             resolved_target_parent = destination.parent.resolve(strict=True)
         except OSError as exc:
             raise ExtractionError(f"无法核对整理路径：{exc}") from exc
-        if source.is_symlink() or resolved_source.parent != resolved_parent or resolved_target_parent != resolved_parent:
+        if is_linked_path(source) or resolved_source.parent != resolved_parent or resolved_target_parent != resolved_parent:
             raise ExtractionError(f"整理路径不在预期位置：{source}")
         if destination.exists():
             raise ExtractionError(f"最终输出目录已存在，避免覆盖：{destination}")
@@ -680,8 +692,8 @@ class ExtractionEngine:
         except OSError as exc:
             raise ExtractionError(f"无法核对文件夹整理路径：{exc}") from exc
         if (
-            stage.is_symlink()
-            or folder.is_symlink()
+            is_linked_path(stage)
+            or is_linked_path(folder)
             or resolved_stage.parent != resolved_parent
             or resolved_folder.parent != resolved_parent
             or not stage.name.startswith(".archive_stage_")
@@ -689,7 +701,7 @@ class ExtractionEngine:
             raise ExtractionError(f"文件夹整理路径不在预期位置：{folder}")
         for entry in stage.iterdir():
             target = folder / entry.name
-            if target.exists() or target.is_symlink():
+            if target.exists() or is_linked_path(target):
                 raise ExtractionError(f"文件夹中已有同名内容，避免覆盖：{target}")
 
     @classmethod
@@ -716,7 +728,7 @@ class ExtractionEngine:
         except OSError as exc:
             raise CleanupError(f"无法核对工作区路径：{workdir}：{exc}") from exc
         if (
-            workdir.is_symlink()
+            is_linked_path(workdir)
             or resolved_workdir.parent != resolved_parent
             or not workdir.name.startswith(".archive_work_")
         ):
@@ -727,7 +739,7 @@ class ExtractionEngine:
             if not isinstance(error, PermissionError):
                 raise error
             resolved_target = target.resolve(strict=True)
-            if target.is_symlink() or target.is_junction() or not resolved_target.is_relative_to(resolved_workdir):
+            if is_linked_path(target) or not resolved_target.is_relative_to(resolved_workdir):
                 raise error
             os.chmod(target, stat.S_IWRITE)
             function(failed_path)
@@ -792,7 +804,7 @@ class ExtractionEngine:
     def _expand(self, source: Path, base: str, parent: Path, number: int) -> Path:
         if number > MAX_LAYERS:
             raise ExtractionError(f"超过 {MAX_LAYERS} 层压缩包：{source}")
-        if source.is_symlink() or not source.is_file():
+        if is_linked_path(source) or not source.is_file():
             raise ExtractionError(f"压缩包文件不可用：{source}")
         destination = parent / f"{base}_解压"
         if destination.exists():
@@ -856,7 +868,7 @@ class ExtractionEngine:
             resolved_attempt = attempt.resolve(strict=True)
         except OSError as exc:
             raise ExtractionError(f"无法核对密码尝试目录：{attempt}：{exc}") from exc
-        if attempt.is_symlink() or resolved_attempt.parent != resolved_parent or not attempt.name.startswith(".archive_attempt_"):
+        if is_linked_path(attempt) or resolved_attempt.parent != resolved_parent or not attempt.name.startswith(".archive_attempt_"):
             raise ExtractionError(f"拒绝清理非本次创建的密码尝试目录：{attempt}")
         try:
             shutil.rmtree(attempt)

@@ -155,6 +155,122 @@ class PublicReleaseTests(unittest.TestCase):
             finally:
                 root.destroy()
 
+    def test_folder_rename_uses_selected_suffix(self) -> None:
+        from archive_gui import ArchiveApp, TkinterDnD
+
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "collection"
+            folder.mkdir()
+            source = folder / "demo.7shanz"
+            source.write_bytes(b"dummy")
+            root = TkinterDnD.Tk()
+            root.withdraw()
+            try:
+                app = ArchiveApp(root, preset_path=Path(temporary) / "presets.json")
+                app.rename_suffix.set(".zip")
+                app._add_paths([folder])
+                iid = next(iter(app.rows))
+                preview = app.table.item(iid, "values")
+                self.assertIn(".zip", preview[1])
+                self.assertIn("待改名 1", preview[2])
+                self.assertEqual(app._rename([iid]), ([iid], 0))
+                self.assertFalse(source.exists())
+                self.assertTrue((folder / "demo.zip").exists())
+            finally:
+                root.destroy()
+
+    def test_folder_rename_conflict_changes_no_files(self) -> None:
+        from archive_gui import ArchiveApp, TkinterDnD
+
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "collection"
+            folder.mkdir()
+            first = folder / "demo.shan7z"
+            second = folder / "demo.7shanz"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            root = TkinterDnD.Tk()
+            root.withdraw()
+            try:
+                app = ArchiveApp(root, preset_path=Path(temporary) / "presets.json")
+                app.rename_suffix.set(".zip")
+                app._add_paths([folder])
+                iid = next(iter(app.rows))
+                self.assertEqual(app._rename([iid]), ([], 1))
+                self.assertEqual(first.read_bytes(), b"first")
+                self.assertEqual(second.read_bytes(), b"second")
+                self.assertFalse((folder / "demo.zip").exists())
+            finally:
+                root.destroy()
+
+    def test_folder_rename_failure_rolls_back_prior_files(self) -> None:
+        from archive_gui import ArchiveApp, TkinterDnD
+
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary) / "collection"
+            folder.mkdir()
+            first = folder / "alpha.shan7z"
+            second = folder / "beta.shan7z"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            root = TkinterDnD.Tk()
+            root.withdraw()
+            try:
+                app = ArchiveApp(root, preset_path=Path(temporary) / "presets.json")
+                app.rename_suffix.set(".zip")
+                app._add_paths([folder])
+                iid = next(iter(app.rows))
+                original_rename = Path.rename
+
+                def fail_second(source: Path, target: Path) -> Path:
+                    if source == second:
+                        raise PermissionError("simulated lock")
+                    return original_rename(source, target)
+
+                with patch.object(Path, "rename", fail_second):
+                    self.assertEqual(app._rename([iid]), ([], 1))
+                self.assertEqual(first.read_bytes(), b"first")
+                self.assertEqual(second.read_bytes(), b"second")
+                self.assertFalse((folder / "alpha.zip").exists())
+            finally:
+                root.destroy()
+
+    def test_nested_folder_jobs_are_rejected_before_extraction(self) -> None:
+        with TemporaryDirectory() as temporary:
+            outer = Path(temporary) / "outer"
+            inner = outer / "inner"
+            inner.mkdir(parents=True)
+            archive = inner / "demo.7z"
+            archive.write_bytes(b"dummy")
+            engine = ExtractionEngine(Path("missing-7z.exe"), "", lambda message: None)
+            with self.assertRaises(ExtractionError):
+                engine.run([
+                    ExtractionJob(outer, "outer", folder_mode=True, archives=(archive,)),
+                    ExtractionJob(inner, "inner", folder_mode=True, archives=(archive,)),
+                ], None, False, max_concurrent=2)
+
+    def test_folder_scan_does_not_follow_windows_junction(self) -> None:
+        with TemporaryDirectory(dir=Path.cwd()) as temporary:
+            root = Path(temporary)
+            folder = root / "input"
+            external = root / "external"
+            folder.mkdir()
+            external.mkdir()
+            (external / "outside.shan7z").write_bytes(b"dummy")
+            junction = folder / "linked"
+            created = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if created.returncode != 0:
+                self.skipTest("Windows junction creation is unavailable")
+            self.assertTrue(junction.is_junction())
+            self.assertEqual(discover_archive_inputs(folder), [])
+            with self.assertRaises(ExtractionError):
+                discover_archive_inputs(junction)
+
     def test_discovery_recognizes_special_suffixes_without_magic_header(self) -> None:
         with TemporaryDirectory() as temporary:
             folder = Path(temporary)

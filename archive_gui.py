@@ -19,6 +19,7 @@ from archive_engine import (
     discover_archive_inputs,
     expand_dropped_folder,
     flatten_existing_result,
+    is_linked_path,
 )
 from archive_logic import extraction_base, plan_renames
 from password_store import default_store_path, load_password_presets, save_password_presets
@@ -228,9 +229,9 @@ class ArchiveApp:
         collected = []
         try:
             for path in paths:
-                if path.is_dir() and not path.is_symlink():
+                if path.is_dir() and not is_linked_path(path):
                     collected.extend(expand_dropped_folder(path, self.recursive.get()))
-                elif path.is_file() and not path.is_symlink():
+                elif path.is_file() and not is_linked_path(path):
                     collected.append(path)
         except ExtractionError as exc:
             messagebox.showerror("读取失败", str(exc))
@@ -246,7 +247,7 @@ class ArchiveApp:
         existing = {str(path).casefold() for path in self.rows.values()}
         added = []
         for path in paths:
-            if path.is_symlink() or not (path.is_file() or path.is_dir()) or str(path).casefold() in existing:
+            if is_linked_path(path) or not (path.is_file() or path.is_dir()) or str(path).casefold() in existing:
                 continue
             if path.is_dir():
                 try:
@@ -272,9 +273,15 @@ class ArchiveApp:
         decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
         for iid, path in self.rows.items():
             if iid in self.folder_archives:
-                count = len(self.folder_archives[iid])
-                state = f"文件夹任务：{count} 个候选压缩文件" if path.is_dir() else "源文件夹不存在"
-                self.table.item(iid, values=(str(path), "直接放回此文件夹", state))
+                archives = self.folder_archives[iid]
+                decisions_in_folder = plan_renames(list(archives), self.rename_suffix.get())
+                pending = sum(decision.status == "rename" for decision in decisions_in_folder)
+                conflicts = sum(decision.status == "conflict" for decision in decisions_in_folder)
+                state = (
+                    f"文件夹任务：{len(archives)} 个压缩文件，待改名 {pending}，冲突 {conflicts}"
+                    if path.is_dir() else "源文件夹不存在"
+                )
+                self.table.item(iid, values=(str(path), f"内部改为 {self.rename_suffix.get()}；结果留原文件夹", state))
             else:
                 decision = decisions[iid]
                 state = decision.detail if decision.source.exists() else "源文件不存在"
@@ -333,14 +340,70 @@ class ArchiveApp:
             return
         self.status.set("5 个密码预设已保存，下次打开时会自动载入。")
 
+    def _rename_folder_archives(self, iid: str) -> tuple[int, bool]:
+        folder = self.rows[iid]
+        try:
+            paths = discover_archive_inputs(folder, self.recursive.get())
+        except ExtractionError as exc:
+            self._log(f"文件夹扫描失败：{folder}：{exc}")
+            return 0, False
+        if not paths:
+            self._log(f"文件夹中没有可处理的压缩包：{folder}")
+            return 0, False
+        decisions = plan_renames(paths, self.rename_suffix.get())
+        blocked = [decision for decision in decisions if decision.status == "conflict" or not decision.source.exists()]
+        if blocked:
+            for decision in blocked:
+                self._log(f"文件夹改名已跳过：{decision.source} → {decision.target.name}：{decision.detail}")
+            return 0, False
+
+        applied = []
+        try:
+            for decision in decisions:
+                if decision.status != "rename":
+                    continue
+                if decision.target.exists():
+                    raise FileExistsError(f"目标文件已存在：{decision.target}")
+                decision.source.rename(decision.target)
+                applied.append(decision)
+        except OSError as exc:
+            rollback_errors = []
+            for decision in reversed(applied):
+                try:
+                    decision.target.rename(decision.source)
+                except OSError as rollback_exc:
+                    rollback_errors.append(f"{decision.target}：{rollback_exc}")
+            self._log(f"文件夹改名失败：{folder}：{exc}")
+            if rollback_errors:
+                self._log(f"部分文件无法恢复原名：{'；'.join(rollback_errors)}")
+            return 0, False
+
+        self.folder_archives[iid] = tuple(decision.target for decision in decisions)
+        changed = {decision.source: decision.target for decision in applied}
+        for row_id, path in self.rows.items():
+            if row_id != iid and path in changed:
+                self.rows[row_id] = changed[path]
+        for decision in applied:
+            self._log(f"已改名：{decision.source.name} → {decision.target.name}")
+        return len(applied), True
+
     def _rename(self, selected: list[str]) -> tuple[list[str], int]:
         file_iids = [iid for iid in self.rows if iid not in self.folder_archives]
         decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
+        selected_folders = [self.rows[iid] for iid in selected if iid in self.folder_archives]
         ready = []
         renamed = skipped = 0
         for iid in selected:
             if iid in self.folder_archives:
-                self._log(f"文件夹任务保留原名；内部伪装分卷会在解压时处理：{self.rows[iid]}")
+                changed, success = self._rename_folder_archives(iid)
+                renamed += changed
+                if success:
+                    ready.append(iid)
+                else:
+                    skipped += 1
+                continue
+            if any(self.rows[iid].is_relative_to(folder) for folder in selected_folders):
+                self._log(f"文件已由所选文件夹任务包含，避免重复改名：{self.rows[iid]}")
                 ready.append(iid)
                 continue
             decision = decisions[iid]
@@ -455,7 +518,7 @@ class ArchiveApp:
             if base is None:
                 continue
             destination = (output_root or candidate.parent) / f"{base}_解压"
-            if destination.exists() or destination.is_symlink():
+            if destination.exists() or is_linked_path(destination):
                 messagebox.showerror("目标目录已存在", f"避免覆盖，解压前请处理已有目录：{destination}")
                 return False
         return True
