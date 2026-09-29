@@ -20,9 +20,16 @@ if errorlevel 1 exit /b 1
 ".venv\Scripts\python.exe" -c "from pathlib import Path; import shutil; root = Path.cwd().resolve(); target = (root / 'build').resolve(); assert target.parent == root; shutil.rmtree(target, ignore_errors=True)"
 if errorlevel 1 exit /b 1
 
-".venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm --onefile --windowed --name ArchiveFixer --collect-all tkinterdnd2 --add-data "THIRD_PARTY_NOTICES.txt;." main.py
+".venv\Scripts\python.exe" -c "from pathlib import Path; import shutil; root=Path.cwd().resolve(); dist=(root/'dist').resolve(); assert dist.parent==root; shutil.rmtree(dist/'ArchiveFixer', ignore_errors=True); (dist/'ArchiveFixer.exe').unlink(missing_ok=True); (dist/'ArchiveFixer-portable.zip').unlink(missing_ok=True)"
 if errorlevel 1 exit /b 1
 
-echo Built: %~dp0dist\ArchiveFixer.exe
-echo Publish the EXE together with THIRD_PARTY_NOTICES.txt in GitHub Releases.
+".venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm --onedir --windowed --name ArchiveFixer --collect-all tkinterdnd2 --add-data "THIRD_PARTY_NOTICES.txt;." main.py
+if errorlevel 1 exit /b 1
+
+".venv\Scripts\python.exe" -c "from pathlib import Path; import shutil; root=Path.cwd().resolve(); dist=(root/'dist').resolve(); shutil.make_archive(str(dist/'ArchiveFixer-portable'), 'zip', root_dir=dist, base_dir='ArchiveFixer')"
+if errorlevel 1 exit /b 1
+
+echo Built folder: %~dp0dist\ArchiveFixer
+echo Built package: %~dp0dist\ArchiveFixer-portable.zip
+echo Publish ArchiveFixer-portable.zip and THIRD_PARTY_NOTICES.txt in GitHub Releases.
 exit /b 0
