@@ -6,9 +6,16 @@ from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from archive_engine import ExtractionEngine, ExtractionJob, discover_archive_inputs, expand_dropped_folder
+from archive_engine import (
+    ExtractionEngine,
+    ExtractionError,
+    ExtractionJob,
+    _normalize_volume_group,
+    discover_archive_inputs,
+    expand_dropped_folder,
+)
 from archive_logic import extraction_base, plan_renames, target_name
 
 
@@ -51,6 +58,26 @@ class PublicReleaseTests(unittest.TestCase):
         for source, expected in cases.items():
             with self.subTest(source=source):
                 self.assertEqual(target_name(source), expected)
+
+    def test_seven_z_shan_alias(self) -> None:
+        with TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "demo.7zshan"
+            archive.write_bytes(b"dummy")
+            self.assertEqual(target_name(archive.name), "demo.7z")
+            self.assertEqual(extraction_base(archive), "demo")
+            self.assertEqual(discover_archive_inputs(archive.parent), [archive])
+
+    def test_archive_deletion_is_opt_in(self) -> None:
+        from archive_gui import ArchiveApp, TkinterDnD
+
+        with TemporaryDirectory() as temporary:
+            root = TkinterDnD.Tk()
+            root.withdraw()
+            try:
+                app = ArchiveApp(root, preset_path=Path(temporary) / "presets.json")
+                self.assertFalse(app.delete_archives.get())
+            finally:
+                root.destroy()
 
     def test_discovery_recognizes_special_suffixes_without_magic_header(self) -> None:
         with TemporaryDirectory() as temporary:
@@ -123,6 +150,97 @@ class PublicReleaseTests(unittest.TestCase):
             self.assertEqual((ready, skipped), ([], 1))
             self.assertTrue(source.exists())
             self.assertTrue(any("改名失败" in message for message in messages))
+
+    def test_combined_action_checks_7zip_before_renaming(self) -> None:
+        from archive_gui import ArchiveApp
+
+        app = ArchiveApp.__new__(ArchiveApp)
+        app.busy = False
+        app.seven_zip = type("Value", (), {"get": lambda self: "missing-7z.exe"})()
+        app._selected = lambda: ["row"]
+        app._rename = Mock(return_value=(["row"], 0))
+        app._start_extract = Mock()
+        with patch("archive_gui.messagebox.showerror"):
+            app._rename_and_extract()
+        app._rename.assert_not_called()
+        app._start_extract.assert_not_called()
+
+    def test_combined_action_checks_existing_output_before_renaming(self) -> None:
+        from archive_gui import ArchiveApp, find_7zip
+
+        seven_zip = find_7zip()
+        if seven_zip is None:
+            self.skipTest("7-Zip is not installed")
+        with TemporaryDirectory() as temporary:
+            source = Path(temporary) / "demo.shan7z"
+            source.write_bytes(b"dummy")
+            (Path(temporary) / "demo_解压").mkdir()
+            app = ArchiveApp.__new__(ArchiveApp)
+            app.busy = False
+            app.seven_zip = type("Value", (), {"get": lambda self: str(seven_zip)})()
+            app.concurrent = type("Value", (), {"get": lambda self: 2})()
+            app.output_dir = type("Value", (), {"get": lambda self: ""})()
+            app.rows = {"row": source}
+            app.folder_archives = {}
+            app._selected = lambda: ["row"]
+            app._rename = Mock(return_value=(["row"], 0))
+            app._start_extract = Mock()
+            with patch("archive_gui.messagebox.showerror"):
+                app._rename_and_extract()
+            app._rename.assert_not_called()
+            app._start_extract.assert_not_called()
+
+    def test_volume_rename_failure_restores_earlier_parts(self) -> None:
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            first = folder / "demo.7z.001删"
+            second = folder / "demo.7z.002删"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            original_rename = Path.rename
+
+            def fail_second(source: Path, target: Path) -> Path:
+                if source == second:
+                    raise PermissionError("simulated lock")
+                return original_rename(source, target)
+
+            with patch.object(Path, "rename", fail_second), self.assertRaises(ExtractionError):
+                _normalize_volume_group(first)
+            self.assertEqual(first.read_bytes(), b"first")
+            self.assertEqual(second.read_bytes(), b"second")
+            self.assertFalse((folder / "demo.7z.001").exists())
+
+    def test_one_bad_archive_does_not_block_valid_job(self) -> None:
+        from archive_gui import find_7zip
+
+        seven_zip = find_7zip()
+        if seven_zip is None:
+            self.skipTest("7-Zip is not installed")
+        with TemporaryDirectory() as temporary:
+            folder = Path(temporary)
+            (folder / "payload.txt").write_text("ok", encoding="utf-8")
+            subprocess.run(
+                [str(seven_zip), "a", "-y", "good.7z", "payload.txt"],
+                cwd=folder,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            bad = folder / "bad.7z"
+            bad.write_bytes(b"not an archive")
+            messages: list[str] = []
+            result = ExtractionEngine(seven_zip, "", messages.append).run(
+                [ExtractionJob(folder / "good.7z", "good"), ExtractionJob(bad, "bad")],
+                None,
+                True,
+                max_concurrent=2,
+            )
+            self.assertEqual(result.successful_jobs, 1)
+            self.assertEqual(result.failed_jobs, 1)
+            self.assertTrue((folder / "good_解压" / "payload.txt").is_file())
+            self.assertFalse((folder / "good.7z").exists())
+            self.assertTrue(bad.exists())
+            self.assertTrue(any("bad.7z" in error for error in result.errors))
 
     def test_nested_password_archive_with_installed_7zip(self) -> None:
         from archive_gui import find_7zip

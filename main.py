@@ -16,6 +16,8 @@ def smoke_test() -> None:
         root.withdraw()
         try:
             app = ArchiveApp(root, preset_path=Path(temporary) / "presets.json")
+            if app.delete_archives.get():
+                raise RuntimeError("Archive deletion should be opt in")
             source = Path(temporary) / "demo.shan7z"
             source.write_bytes(b"sample")
             app._add_paths([source])

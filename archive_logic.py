@@ -8,8 +8,8 @@ import re
 
 
 VOLUME_RE = re.compile(r"\.(0[0-9]{3}|[0-9]{3})(?![0-9])")
-ARCHIVE_SUFFIXES = frozenset({".7z", ".shan7z", ".7shanz", ".zip", ".rar", ".tar", ".gz", ".bz2", ".xz", ".cab", ".iso", ".wim"})
-DISGUISED_SEVEN_ZIP_SUFFIXES = frozenset({".shan7z", ".7shanz"})
+ARCHIVE_SUFFIXES = frozenset({".7z", ".shan7z", ".7shanz", ".7zshan", ".zip", ".rar", ".tar", ".gz", ".bz2", ".xz", ".cab", ".iso", ".wim"})
+DISGUISED_SEVEN_ZIP_SUFFIXES = frozenset({".shan7z", ".7shanz", ".7zshan"})
 
 
 @dataclass(frozen=True)

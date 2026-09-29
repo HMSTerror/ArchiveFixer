@@ -71,7 +71,7 @@ class ArchiveApp:
         self.output_dir = tk.StringVar()
         self.recursive = tk.BooleanVar(value=True)
         self.concurrent = tk.IntVar(value=2)
-        self.delete_archives = tk.BooleanVar(value=True)
+        self.delete_archives = tk.BooleanVar(value=False)
         self.show_password = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="拖入文件或文件夹后，先预览再执行。")
 
@@ -169,7 +169,7 @@ class ArchiveApp:
         ttk.Label(settings, text="留空则在每个压缩包旁生成一个“文件名_解压”结果目录，去掉压缩层目录。", foreground="#555555").grid(row=3, column=1, sticky="w", padx=8)
         ttk.Checkbutton(
             settings,
-            text="全部层级成功后删除原始及中间压缩包（默认开启）",
+            text="全部层级成功后删除原始及中间压缩包（默认关闭）",
             variable=self.delete_archives,
         ).grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=(5, 0))
         ttk.Label(settings, text="同时解压任务数").grid(row=5, column=0, sticky="w", pady=(5, 0))
@@ -383,6 +383,8 @@ class ArchiveApp:
             return
         selected = self._selected()
         if selected:
+            if not self._preflight_combined(selected):
+                return
             ready, skipped = self._rename(selected)
             if skipped:
                 self._log("部分文件改名失败，本批次未开始解压；请处理后重试。")
@@ -405,10 +407,47 @@ class ArchiveApp:
             self._log(message)
             self.status.set(message)
 
-    def _start_extract(self, selected: list[str]) -> None:
+    def _resolve_7zip(self) -> Path | None:
         executable = Path(self.seven_zip.get().strip().strip('"'))
         if not executable.is_file():
             messagebox.showerror("找不到 7-Zip", "请在“7-Zip 程序”中选择本机的 7z.exe。")
+            return None
+        return executable
+
+    def _preflight_combined(self, selected: list[str]) -> bool:
+        if self._resolve_7zip() is None:
+            return False
+        try:
+            max_concurrent = self.concurrent.get()
+        except tk.TclError:
+            max_concurrent = 0
+        if not 1 <= max_concurrent <= 8:
+            messagebox.showerror("任务数无效", "同时解压任务数请输入 1 到 8。")
+            return False
+        output_text = self.output_dir.get().strip()
+        output_root = Path(output_text).expanduser() if output_text else None
+        if output_root is not None and output_root.exists() and not output_root.is_dir():
+            messagebox.showerror("目标目录无效", f"解压目标不是文件夹：{output_root}")
+            return False
+        file_iids = [iid for iid in self.rows if iid not in self.folder_archives]
+        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids])))
+        for iid in selected:
+            if iid in self.folder_archives:
+                continue
+            decision = decisions[iid]
+            candidate = decision.target if decision.status == "rename" else decision.source
+            base = extraction_base(candidate)
+            if base is None:
+                continue
+            destination = (output_root or candidate.parent) / f"{base}_解压"
+            if destination.exists() or destination.is_symlink():
+                messagebox.showerror("目标目录已存在", f"避免覆盖，解压前请处理已有目录：{destination}")
+                return False
+        return True
+
+    def _start_extract(self, selected: list[str]) -> None:
+        executable = self._resolve_7zip()
+        if executable is None:
             return
         output_text = self.output_dir.get().strip()
         output_root = Path(output_text).expanduser() if output_text else None
@@ -480,8 +519,11 @@ class ArchiveApp:
             self.events.put(("log", f"处理意外中断：{exc}"))
             self.events.put(("done", "处理意外中断；请查看操作记录。"))
         else:
+            for error in result.errors:
+                self.events.put(("log", f"任务失败：{error}"))
             summary = (
-                f"完成：任务 {result.outer_archives} 个，累计 {result.layers} 层，"
+                f"完成：成功 {result.successful_jobs}/{result.outer_archives} 个任务，"
+                f"失败 {result.failed_jobs} 个，累计 {result.layers} 层，"
                 f"最终文件 {result.final_files} 个，删除压缩包文件 {result.deleted_archives} 个。"
             )
             self.events.put(("log", summary))

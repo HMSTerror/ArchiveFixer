@@ -17,7 +17,7 @@ from uuid import uuid4
 from archive_logic import volume_part
 
 
-ARCHIVE_HINT = re.compile(r"(?i)\.(?:7z|shan7z|7shanz|zip|rar|tar|gz|bz2|xz|cab|iso|wim)(?=\.|$)")
+ARCHIVE_HINT = re.compile(r"(?i)\.(?:7z|shan7z|7shanz|7zshan|zip|rar|tar|gz|bz2|xz|cab|iso|wim)(?=\.|$)")
 TERMINAL_CONTAINER_SUFFIXES = frozenset({
     ".apk", ".aab", ".ipa", ".jar", ".war", ".ear",
     ".docx", ".xlsx", ".pptx", ".epub", ".odt", ".ods", ".odp",
@@ -56,6 +56,9 @@ class BatchResult:
     layers: int
     final_files: int
     deleted_archives: int
+    successful_jobs: int = 0
+    failed_jobs: int = 0
+    errors: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -147,7 +150,7 @@ def discover_archive_inputs(folder: Path, recursive: bool = True) -> list[Path]:
             raise ExtractionError(f"无法扫描文件夹：{folder}：{exc}") from exc
         has_launcher = any(path.suffix.casefold() == ".exe" for path in direct_files)
         has_direct_archive = any(
-            path.suffix.casefold() in {".7z", ".rar", ".shan7z", ".7shanz"}
+            path.suffix.casefold() in {".7z", ".rar", ".shan7z", ".7shanz", ".7zshan"}
             or ((part := volume_part(path.name)) is not None and part[1] == 1)
             for path in direct_files
         )
@@ -306,12 +309,25 @@ def _normalize_volume_group(first: Path) -> Path:
     for source, target in zip(group, targets):
         if source != target and target.exists():
             raise ExtractionError(f"分卷目标文件已存在：{target}")
+    renamed: list[tuple[Path, Path]] = []
     for source, target in zip(group, targets):
-        if source != target:
-            try:
-                source.rename(target)
-            except OSError as exc:
-                raise ExtractionError(f"分卷改名失败：{source}：{exc}") from exc
+        if source == target:
+            continue
+        try:
+            source.rename(target)
+            renamed.append((source, target))
+        except OSError as exc:
+            rollback_errors = []
+            for original, changed in reversed(renamed):
+                try:
+                    changed.rename(original)
+                except OSError as rollback_exc:
+                    rollback_errors.append(f"{changed}：{rollback_exc}")
+            if rollback_errors:
+                raise ExtractionError(
+                    f"分卷改名失败：{source}：{exc}；回滚未全部成功：{'；'.join(rollback_errors)}"
+                ) from exc
+            raise ExtractionError(f"分卷改名失败，已回滚：{source}：{exc}") from exc
     return first.with_name(first.name[: volume_part(first.name)[0]])
 
 
@@ -444,6 +460,7 @@ class ExtractionEngine:
                 if file_spec.source.is_relative_to(folder_spec.source):
                     raise ExtractionError(f"同一压缩包同时被单独选择和文件夹任务包含：{file_spec.source}")
         self.layers = []
+        workdirs: dict[Path, Path] = {}
 
         def process_one(spec: ExtractionJob) -> JobResult:
             worker = ExtractionEngine(self.executable, self.passwords, self.log)
@@ -451,6 +468,7 @@ class ExtractionEngine:
             try:
                 parent.mkdir(parents=True, exist_ok=True)
                 workdir = Path(tempfile.mkdtemp(prefix=".archive_work_", dir=parent))
+                workdirs[spec.source] = workdir
             except OSError as exc:
                 raise ExtractionError(f"无法创建解压工作区：{parent}：{exc}") from exc
             branches: list[BranchResult] = []
@@ -489,34 +507,46 @@ class ExtractionEngine:
                     result = future.result()
                 except Exception as exc:
                     errors.append(f"{source.name}：{exc}")
+                    workdir = workdirs.get(source)
+                    if workdir is not None and workdir.exists():
+                        self.log(f"失败任务的工作目录已保留，可检查后手动清理：{workdir}")
                 else:
                     results.append(result)
-                    self.layers.extend(result.layers)
-        if errors:
-            raise ExtractionError("；".join(errors))
 
-        stages: list[tuple[JobResult, Path]] = []
+        completed: list[JobResult] = []
         final_files = 0
+        deleted = 0
         for result in results:
-            stage = Path(tempfile.mkdtemp(prefix=".archive_stage_", dir=result.parent))
-            final_files += self._stage_final_content(result, stage)
-            stages.append((result, stage))
-
-        if delete_archives:
-            self._verify_archive_snapshots(self.layers)
-        for result, stage in stages:
-            if result.folder_mode:
-                self._check_folder_stage_merge(stage, result.source)
-        for result, stage in stages:
-            final_path = result.source if result.folder_mode else result.parent / f"{result.base}_解压"
-            if result.folder_mode:
-                self._merge_stage_into_folder(stage, final_path, result.parent)
+            stage: Path | None = None
+            try:
+                stage = Path(tempfile.mkdtemp(prefix=".archive_stage_", dir=result.parent))
+                staged_files = self._stage_final_content(result, stage)
+                if delete_archives:
+                    self._verify_archive_snapshots(result.layers)
+                if result.folder_mode:
+                    self._check_folder_stage_merge(stage, result.source)
+                final_path = result.source if result.folder_mode else result.parent / f"{result.base}_解压"
+                if result.folder_mode:
+                    self._merge_stage_into_folder(stage, final_path, result.parent)
+                else:
+                    self._rename_owned_directory(stage, final_path, result.parent)
+                self.log(f"最终内容已整理到：{final_path}")
+                deleted_for_job = self._cleanup_workdirs([result], delete_archives)
+            except Exception as exc:
+                errors.append(f"{result.source.name}：{exc}")
+                for temporary in (result.workdir, stage):
+                    if temporary is not None and temporary.exists():
+                        self.log(f"任务未完整完成，暂存目录已保留供检查：{temporary}")
             else:
-                self._rename_owned_directory(stage, final_path, result.parent)
-            self.log(f"最终内容已整理到：{final_path}")
+                completed.append(result)
+                final_files += staged_files
+                deleted += deleted_for_job
 
-        deleted = self._cleanup_workdirs(results, delete_archives)
-        return BatchResult(len(jobs), len(self.layers), final_files, deleted)
+        self.layers = [layer for result in completed for layer in result.layers]
+        return BatchResult(
+            len(jobs), len(self.layers), final_files, deleted,
+            len(completed), len(errors), tuple(errors),
+        )
 
     @staticmethod
     def _mapped_relative(path: Path, root: Path, wrappers: set[Path]) -> Path:
@@ -709,7 +739,12 @@ class ExtractionEngine:
                 self.log(f"压缩层已保留在：{backup}")
             return 0
 
-        deleted = len({snapshot.path for layer in self.layers for snapshot in layer.archive_files})
+        deleted = len({
+            snapshot.path
+            for result in results
+            for layer in result.layers
+            for snapshot in layer.archive_files
+        })
         for result in results:
             self._remove_owned_workdir(result.workdir, result.parent)
         root_archives = {
