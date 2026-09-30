@@ -69,11 +69,13 @@ class PublicReleaseTests(unittest.TestCase):
         self.assertIn(f"-o{destination}", seven_zip)
         self.assertEqual(seven_zip[-1], str(source))
 
-        winrar = extraction_command("winrar", Path("Rar.exe"), source, destination, "secret")
-        self.assertEqual(winrar[:4], ["Rar.exe", "x", "-y", "-o-"])
+        winrar = extraction_command("winrar", Path("WinRAR.exe"), source, destination, "secret")
+        self.assertEqual(winrar[:4], ["WinRAR.exe", "x", "-y", "-o-"])
+        self.assertIn("-inul", winrar)
+        self.assertIn("-ibck", winrar)
         self.assertIn("-psecret", winrar)
         self.assertEqual(winrar[-1], str(destination) + "\\")
-        self.assertIn("-p-", extraction_command("winrar", Path("Rar.exe"), source, destination, ""))
+        self.assertIn("-p-", extraction_command("winrar", Path("WinRAR.exe"), source, destination, ""))
 
         bandizip = extraction_command("bandizip", Path("bz.exe"), source, destination, "secret")
         self.assertEqual(bandizip[:3], ["bz.exe", "x", "-y"])
@@ -86,7 +88,7 @@ class PublicReleaseTests(unittest.TestCase):
     def test_find_winrar_and_bandizip_console_tools(self) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)
-            winrar = root / "WinRAR" / "Rar.exe"
+            winrar = root / "WinRAR" / "WinRAR.exe"
             bandizip = root / "Bandizip" / "bz.exe"
             winrar.parent.mkdir()
             bandizip.parent.mkdir()

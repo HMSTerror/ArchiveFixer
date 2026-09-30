@@ -20,7 +20,7 @@ def find_extractor(kind: str) -> Path | None:
         raise ValueError(f"不支持的解压程序：{kind}")
     commands = {
         "7zip": ("7z", "7za"),
-        "winrar": ("rar", "rar.exe"),
+        "winrar": ("WinRAR", "WinRAR.exe"),
         "bandizip": ("bz", "bz.exe"),
     }
     candidates = [shutil.which(command) for command in commands[kind]]
@@ -32,7 +32,7 @@ def find_extractor(kind: str) -> Path | None:
         if kind == "7zip":
             candidates.append(str(root_path / "7-Zip" / "7z.exe"))
         elif kind == "winrar":
-            candidates.append(str(root_path / "WinRAR" / "Rar.exe"))
+            candidates.append(str(root_path / "WinRAR" / "WinRAR.exe"))
         else:
             candidates.extend((
                 str(root_path / "Bandizip" / "bz.exe"),
@@ -58,7 +58,10 @@ def find_extractor(kind: str) -> Path | None:
     return None
 
 
-def extraction_command(kind: str, executable: Path, source: Path, destination: Path, password: str) -> list[str]:
+def extraction_command(
+    kind: str, executable: Path, source: Path, destination: Path, password: str,
+    error_log: Path | None = None,
+) -> list[str]:
     """Build one unattended extraction attempt into a new destination folder."""
     if kind == "7zip":
         return [
@@ -67,10 +70,14 @@ def extraction_command(kind: str, executable: Path, source: Path, destination: P
             f"-p{password if password else '-'}", f"-o{destination}", str(source),
         ]
     if kind == "winrar":
-        return [
-            str(executable), "x", "-y", "-o-",
+        # Rar.exe handles RAR only; WinRAR.exe also handles ZIP and 7z.
+        args = [
+            str(executable), "x", "-y", "-o-", "-ibck", "-inul", "-cfg-",
             f"-p{password if password else '-'}", str(source), str(destination) + os.sep,
         ]
+        if error_log is not None:
+            args.insert(2, f"-ilog{error_log}")
+        return args
     if kind == "bandizip":
         args = [str(executable), "x", "-y", "-aos", "-consolemode:utf8"]
         if password:

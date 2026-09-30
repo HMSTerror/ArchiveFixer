@@ -1,4 +1,4 @@
-"""Expand nested archives with one password, then remove archive layers on success."""
+"""Expand nested archives with password presets and commit each result safely."""
 
 from __future__ import annotations
 
@@ -60,6 +60,7 @@ class BatchResult:
     successful_jobs: int = 0
     failed_jobs: int = 0
     errors: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,8 +128,6 @@ def _is_terminal_container(path: Path) -> bool:
 
 
 def _is_save_archive_path(path: Path, scan_root: Path) -> bool:
-    if not ARCHIVE_HINT.search(path.name):
-        return False
     relative = path.relative_to(scan_root)
     directory_marker = any(SAVE_PATH_RE.search(part) for part in relative.parts[:-1])
     file_marker = bool(SAVE_PATH_RE.search(path.stem))
@@ -433,6 +432,7 @@ def _nested_candidates(destination: Path, log: Callable[[str], None] | None = No
 
 
 class ExtractionEngine:
+    # Note: commit/cleanup and vendor errors — .agents/notes/implemented/bug-fix/2026-09-30-result-commit-and-vendor-errors.md
     def __init__(
         self,
         executable: Path,
@@ -468,9 +468,21 @@ class ExtractionEngine:
         if len({str(path).casefold() for path in final_paths}) != len(final_paths):
             raise ExtractionError("多个压缩包会输出到同一个文件夹；请调整选择或输出目录。")
         for spec, path in zip(specs, final_paths):
+            if is_linked_path(spec.source):
+                raise ExtractionError(f"拒绝处理链接路径：{spec.source}")
             if spec.folder_mode and not path.is_dir():
                 raise ExtractionError(f"待处理文件夹不存在：{path}")
-            if not spec.folder_mode and path.exists():
+            if spec.folder_mode:
+                root = spec.source.resolve(strict=True)
+                for archive in spec.archives:
+                    if not archive.resolve().is_relative_to(root):
+                        raise ExtractionError(f"压缩包不在所选文件夹内：{archive}")
+                    if is_linked_path(archive) or any(
+                        is_linked_path(parent) for parent in archive.parents
+                        if parent.is_relative_to(spec.source)
+                    ):
+                        raise ExtractionError(f"拒绝处理链接中的压缩包：{archive}")
+            if not spec.folder_mode and (path.exists() or is_linked_path(path)):
                 raise ExtractionError(f"最终输出目录已存在，避免覆盖：{path}")
         for folder_spec in (spec for spec in specs if spec.folder_mode):
             for file_spec in (spec for spec in specs if not spec.folder_mode):
@@ -536,6 +548,7 @@ class ExtractionEngine:
                     results.append(result)
 
         completed: list[JobResult] = []
+        warnings: list[str] = []
         final_files = 0
         deleted = 0
         for result in results:
@@ -553,7 +566,6 @@ class ExtractionEngine:
                 else:
                     self._rename_owned_directory(stage, final_path, result.parent)
                 self.log(f"最终内容已整理到：{final_path}")
-                deleted_for_job = self._cleanup_workdirs([result], delete_archives)
             except Exception as exc:
                 errors.append(f"{result.source.name}：{exc}")
                 for temporary in (result.workdir, stage):
@@ -562,12 +574,25 @@ class ExtractionEngine:
             else:
                 completed.append(result)
                 final_files += staged_files
-                deleted += deleted_for_job
+                # Once the result is committed, a cleanup failure cannot undo it.
+                if result.folder_mode:
+                    try:
+                        stage.rmdir()
+                    except OSError as exc:
+                        warning = f"{result.source.name}：最终内容已交付，但空暂存目录未清理：{stage}：{exc}"
+                        warnings.append(warning)
+                        self.log(warning)
+                try:
+                    deleted += self._cleanup_workdirs([result], delete_archives)
+                except Exception as exc:
+                    warning = f"{result.source.name}：最终内容已交付，但压缩层清理未完成：{exc}"
+                    warnings.append(warning)
+                    self.log(warning)
 
         self.layers = [layer for result in completed for layer in result.layers]
         return BatchResult(
             len(jobs), len(self.layers), final_files, deleted,
-            len(completed), len(errors), tuple(errors),
+            len(completed), len(errors), tuple(errors), tuple(warnings),
         )
 
     @staticmethod
@@ -709,16 +734,21 @@ class ExtractionEngine:
         if folder.parent.resolve(strict=True) != parent.resolve(strict=True):
             raise ExtractionError(f"文件夹不在预期输出位置：{folder}")
         cls._check_folder_stage_merge(stage, folder)
+        moved: list[tuple[Path, Path]] = []
         for entry in list(stage.iterdir()):
             target = folder / entry.name
             try:
                 entry.rename(target)
+                moved.append((entry, target))
             except OSError as exc:
-                raise ExtractionError(f"无法将最终内容放入原文件夹：{target}：{exc}") from exc
-        try:
-            stage.rmdir()
-        except OSError as exc:
-            raise ExtractionError(f"最终内容已放入原文件夹，但暂存目录未清理：{stage}：{exc}") from exc
+                rollback_errors = []
+                for original, changed in reversed(moved):
+                    try:
+                        changed.rename(original)
+                    except OSError as rollback_exc:
+                        rollback_errors.append(f"{changed}：{rollback_exc}")
+                detail = f"回滚未全部成功：{'；'.join(rollback_errors)}" if rollback_errors else "已回滚"
+                raise ExtractionError(f"无法将最终内容放入原文件夹，{detail}：{target}：{exc}") from exc
 
     @staticmethod
     def _remove_owned_workdir(workdir: Path, parent: Path) -> None:
@@ -820,7 +850,8 @@ class ExtractionEngine:
                 attempt = Path(tempfile.mkdtemp(prefix=".archive_attempt_", dir=parent))
             except OSError as exc:
                 raise ExtractionError(f"无法创建密码尝试目录：{parent}：{exc}") from exc
-            args = extraction_command(self.backend, self.executable, source, attempt, password)
+            error_log = parent / f".archive_diagnostic_{uuid4().hex}.log" if self.backend == "winrar" else None
+            args = extraction_command(self.backend, self.executable, source, attempt, password, error_log)
             self.log(f"第 {number} 层尝试预设密码 {index}/{len(self.passwords)}：{source.name}")
             try:
                 command = subprocess.run(
@@ -837,15 +868,27 @@ class ExtractionEngine:
             except OSError as exc:
                 self._remove_attempt(attempt, parent)
                 raise ExtractionError(f"无法启动 {EXTRACTOR_LABELS[self.backend]}：{exc}") from exc
-            if command.returncode == 0:
+            diagnostic = ""
+            if error_log is not None and error_log.exists():
+                try:
+                    diagnostic = error_log.read_bytes().decode("utf-16", errors="replace").strip()
+                    error_log.unlink()
+                except OSError as exc:
+                    raise ExtractionError(f"无法核对 WinRAR 错误记录，原包已保留：{error_log}：{exc}") from exc
+            # Some WinRAR errors return zero with -inul, including wrong 7z passwords.
+            # A nonempty error log is a failed attempt even on the trial edition.
+            has_output = any(attempt.iterdir())
+            if command.returncode == 0 and not diagnostic and has_output:
                 try:
                     attempt.rename(destination)
                 except OSError as exc:
                     raise ExtractionError(f"无法保存成功的解压结果：{destination}：{exc}") from exc
                 self.log(f"第 {number} 层使用预设密码 {index} 解压成功：{source.name}")
                 break
-            lines = (command.stderr or command.stdout).strip().splitlines()
-            last_error = " | ".join(lines[-4:]) if lines else f"退出码 {command.returncode}"
+            lines = (diagnostic or command.stderr or command.stdout).strip().splitlines()
+            last_error = " | ".join(lines[-4:]) if lines else (
+                f"退出码 {command.returncode}" if command.returncode else "解压程序未产生内容；请检查密码或压缩包"
+            )
             for secret in self.passwords:
                 if secret:
                     last_error = last_error.replace(secret, "[已隐藏]")
@@ -870,8 +913,18 @@ class ExtractionEngine:
             raise ExtractionError(f"无法核对密码尝试目录：{attempt}：{exc}") from exc
         if is_linked_path(attempt) or resolved_attempt.parent != resolved_parent or not attempt.name.startswith(".archive_attempt_"):
             raise ExtractionError(f"拒绝清理非本次创建的密码尝试目录：{attempt}")
+
+        def clear_readonly(function: Callable[[str], None], failed_path: str, error: BaseException) -> None:
+            target = Path(failed_path)
+            if not isinstance(error, PermissionError):
+                raise error
+            if is_linked_path(target) or not target.resolve(strict=True).is_relative_to(resolved_attempt):
+                raise error
+            os.chmod(target, stat.S_IWRITE)
+            function(failed_path)
+
         try:
-            shutil.rmtree(attempt)
+            shutil.rmtree(attempt, onexc=clear_readonly)
         except OSError as exc:
             raise ExtractionError(f"无法清理失败的密码尝试目录：{attempt}：{exc}") from exc
 

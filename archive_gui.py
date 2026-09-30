@@ -23,6 +23,7 @@ from archive_engine import (
 )
 from archive_logic import extraction_base, plan_renames
 from password_store import default_store_path, load_password_presets, save_password_presets
+from version import VERSION
 
 
 DEFAULT_PASSWORD = ""
@@ -36,7 +37,7 @@ def find_7zip() -> Path | None:
 class ArchiveApp:
     def __init__(self, root: tk.Tk, preset_path: Path | None = None) -> None:
         self.root = root
-        self.root.title("压缩包后缀修复与解压")
+        self.root.title(f"ArchiveFixer v{VERSION} — 压缩包后缀修复与解压")
         self.root.geometry("1120x760")
         self.root.minsize(800, 540)
         self.rows: dict[str, Path] = {}
@@ -388,9 +389,13 @@ class ArchiveApp:
         return len(applied), True
 
     def _rename(self, selected: list[str]) -> tuple[list[str], int]:
-        file_iids = [iid for iid in self.rows if iid not in self.folder_archives]
-        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
+        if not self._validate_folder_selection(selected):
+            return [], len(selected)
         selected_folders = [self.rows[iid] for iid in selected if iid in self.folder_archives]
+        file_iids = [iid for iid in selected if iid not in self.folder_archives and not any(
+            self.rows[iid].is_relative_to(folder) for folder in selected_folders
+        )]
+        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
         ready = []
         renamed = skipped = 0
         for iid in selected:
@@ -483,17 +488,32 @@ class ArchiveApp:
             return None
         executable = Path(self.extractor_path.get().strip().strip('"'))
         if not executable.is_file():
-            names = {"7zip": "7z.exe", "winrar": "Rar.exe", "bandizip": "bz.exe"}
+            names = {"7zip": "7z.exe", "winrar": "WinRAR.exe", "bandizip": "bz.exe"}
             messagebox.showerror("找不到解压程序", f"请安装 {label}，并选择本机的 {names[backend]}。")
             return None
-        expected = {"7zip": {"7z.exe", "7za.exe"}, "winrar": {"rar.exe"}, "bandizip": {"bz.exe"}}
+        expected = {
+            "7zip": {"7z.exe", "7za.exe"},
+            "winrar": {"winrar.exe"},
+            "bandizip": {"bz.exe", "bz.x64.exe", "bz.x86.exe", "bz.a64.exe"},
+        }
         if executable.name.casefold() not in expected[backend]:
             messagebox.showerror("程序类型不匹配", f"请选择 {label} 的命令行程序。")
             return None
         return executable, backend
 
+    def _validate_folder_selection(self, selected: list[str]) -> bool:
+        folders = [self.rows[iid].resolve() for iid in selected if iid in self.folder_archives]
+        for index, folder in enumerate(folders):
+            for other in folders[index + 1:]:
+                if folder.is_relative_to(other) or other.is_relative_to(folder):
+                    messagebox.showerror("重复选择", f"同一批请只保留父文件夹或子文件夹中的一个：\n{folder}\n{other}")
+                    return False
+        return True
+
     def _preflight_combined(self, selected: list[str]) -> bool:
         if self._resolve_extractor() is None:
+            return False
+        if not self._validate_folder_selection(selected):
             return False
         try:
             max_concurrent = self.concurrent.get()
@@ -507,11 +527,12 @@ class ArchiveApp:
         if output_root is not None and output_root.exists() and not output_root.is_dir():
             messagebox.showerror("目标目录无效", f"解压目标不是文件夹：{output_root}")
             return False
-        file_iids = [iid for iid in self.rows if iid not in self.folder_archives]
+        selected_folders = [self.rows[iid] for iid in selected if iid in self.folder_archives]
+        file_iids = [iid for iid in selected if iid not in self.folder_archives and not any(
+            self.rows[iid].is_relative_to(folder) for folder in selected_folders
+        )]
         decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
-        for iid in selected:
-            if iid in self.folder_archives:
-                continue
+        for iid in file_iids:
             decision = decisions[iid]
             candidate = decision.target if decision.status == "rename" else decision.source
             base = extraction_base(candidate)
@@ -524,6 +545,8 @@ class ArchiveApp:
         return True
 
     def _start_extract(self, selected: list[str]) -> None:
+        if not self._validate_folder_selection(selected):
+            return
         resolved = self._resolve_extractor()
         if resolved is None:
             return
@@ -601,9 +624,11 @@ class ArchiveApp:
         else:
             for error in result.errors:
                 self.events.put(("log", f"任务失败：{error}"))
+            for warning in result.warnings:
+                self.events.put(("log", f"清理提示：{warning}"))
             summary = (
                 f"完成：成功 {result.successful_jobs}/{result.outer_archives} 个任务，"
-                f"失败 {result.failed_jobs} 个，累计 {result.layers} 层，"
+                f"失败 {result.failed_jobs} 个，清理提示 {len(result.warnings)} 个，累计 {result.layers} 层，"
                 f"最终文件 {result.final_files} 个，删除压缩包文件 {result.deleted_archives} 个。"
             )
             self.events.put(("log", summary))
