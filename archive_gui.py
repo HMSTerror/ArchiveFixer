@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 from queue import Empty, Queue
 import threading
 import tkinter as tk
@@ -20,8 +21,12 @@ from archive_engine import (
     expand_dropped_folder,
     flatten_existing_result,
     is_linked_path,
+    JobOutcome,
+    _volume_group,
 )
-from archive_logic import extraction_base, plan_renames
+from archive_plan import plan_batch
+from archive_reports import redact_secrets
+from archive_logic import plan_renames
 from password_store import default_store_path, load_password_presets, save_password_presets
 from version import VERSION
 
@@ -42,8 +47,13 @@ class ArchiveApp:
         self.root.minsize(800, 540)
         self.rows: dict[str, Path] = {}
         self.folder_archives: dict[str, tuple[Path, ...]] = {}
-        self.events: Queue[tuple[str, str]] = Queue()
+        self.events: Queue[tuple[str, object]] = Queue()
         self.busy = False
+        self.cancel_event = threading.Event()
+        self.row_statuses: dict[str, str] = {}
+        self.outcomes: dict[str, JobOutcome] = {}
+        self.finished_sources: set[Path] = set()
+        self.session_secrets: set[str] = set()
         self.preset_path = preset_path or default_store_path()
 
         self.extractor_paths = {kind: str(find_extractor(kind) or "") for kind in EXTRACTOR_LABELS}
@@ -186,11 +196,32 @@ class ArchiveApp:
             ("逐层解压所选", self._extract_selected),
             ("改名并逐层解压所选", self._rename_and_extract),
             ("整理已有结果", self._flatten_existing),
+            ("预检所选", self._preview_selected),
         ):
             button = ttk.Button(actions, text=label, command=command)
-            button.pack(side="left", padx=(0, 8))
+            button.grid(row=0, column=len(self.action_buttons), padx=(0, 8), sticky="w")
             self.action_buttons.append(button)
-        ttk.Label(actions, textvariable=self.status).pack(side="left", padx=8)
+        for column, (label, command) in enumerate((("重试失败/取消", self._retry_failed),
+                                                   ("打开结果", self._open_results),
+                                                   ("导出日志", self._export_log))):
+            button = ttk.Button(actions, text=label, command=command)
+            button.grid(row=1, column=column, padx=(0, 8), pady=(6, 0), sticky="w")
+            self.action_buttons.append(button)
+        self.cancel_button = ttk.Button(actions, text="取消本批次", command=self._cancel_batch, state="disabled")
+        self.cancel_button.grid(row=1, column=3, padx=(0, 8), pady=(6, 0), sticky="w")
+        self.progress_bar = ttk.Progressbar(actions, length=135, mode="determinate")
+        self.progress_bar.grid(row=1, column=4, pady=(6, 0), sticky="ew")
+        ttk.Label(outer, textvariable=self.status, wraplength=1000).grid(row=6, column=0, sticky="ew", pady=(6, 0))
+
+        def controls(frame):
+            found = []
+            for widget in frame.winfo_children():
+                if isinstance(widget, (ttk.Entry, ttk.Combobox, ttk.Button, ttk.Checkbutton, ttk.Spinbox)):
+                    found.append(widget)
+                found.extend(controls(widget))
+            return found
+
+        self.config_widgets = controls(settings) + controls(buttons)
 
         log_frame = ttk.LabelFrame(outer, text="操作记录", padding=8)
         log_frame.grid(row=5, column=0, sticky="ew", pady=(10, 0))
@@ -282,11 +313,13 @@ class ArchiveApp:
                     f"文件夹任务：{len(archives)} 个压缩文件，待改名 {pending}，冲突 {conflicts}"
                     if path.is_dir() else "源文件夹不存在"
                 )
-                self.table.item(iid, values=(str(path), f"内部改为 {self.rename_suffix.get()}；结果留原文件夹", state))
+                self.table.item(iid, values=(str(path), f"内部改为 {self.rename_suffix.get()}；结果留原文件夹", self.row_statuses.get(iid, state)))
             else:
                 decision = decisions[iid]
                 state = decision.detail if decision.source.exists() else "源文件不存在"
-                self.table.item(iid, values=(str(decision.source), decision.target.name, state))
+                outcome = self.outcomes.get(iid)
+                target = str(outcome.destination) if outcome and outcome.destination else decision.target.name
+                self.table.item(iid, values=(str(decision.source), target, self.row_statuses.get(iid, state)))
 
     def _selected(self) -> list[str]:
         selection = list(self.table.selection())
@@ -302,12 +335,16 @@ class ArchiveApp:
             self.table.delete(iid)
             self.rows.pop(iid, None)
             self.folder_archives.pop(iid, None)
+            self.row_statuses.pop(iid, None)
+            self.outcomes.pop(iid, None)
         self._refresh_preview()
 
     def _clear(self) -> None:
         self.table.delete(*self.table.get_children())
         self.rows.clear()
         self.folder_archives.clear()
+        self.row_statuses.clear()
+        self.outcomes.clear()
         self.status.set("列表已清空。")
 
     def _on_extractor_change(self, event: tk.Event | None = None) -> None:
@@ -395,10 +432,15 @@ class ArchiveApp:
         file_iids = [iid for iid in selected if iid not in self.folder_archives and not any(
             self.rows[iid].is_relative_to(folder) for folder in selected_folders
         )]
-        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
+        groups = {iid: _volume_group(self.rows[iid]) or [self.rows[iid]] for iid in file_iids}
+        files = list(dict.fromkeys(path for paths in groups.values() for path in paths))
+        decisions = {decision.source: decision for decision in plan_renames(files, self.rename_suffix.get())}
+        processed: set[Path] = set()
         ready = []
         renamed = skipped = 0
         for iid in selected:
+            getattr(self, "row_statuses", {}).pop(iid, None)
+            getattr(self, "outcomes", {}).pop(iid, None)
             if iid in self.folder_archives:
                 changed, success = self._rename_folder_archives(iid)
                 renamed += changed
@@ -411,28 +453,44 @@ class ArchiveApp:
                 self._log(f"文件已由所选文件夹任务包含，避免重复改名：{self.rows[iid]}")
                 ready.append(iid)
                 continue
-            decision = decisions[iid]
-            if not decision.source.exists():
-                self._log(f"跳过：源文件不存在：{decision.source}")
-                skipped += 1
-            elif decision.status == "conflict":
-                self._log(f"跳过：{decision.detail}：{decision.source} → {decision.target.name}")
-                skipped += 1
-            elif decision.status == "unchanged":
+            group = [decisions[path] for path in groups[iid] if path not in processed]
+            if not group:
                 ready.append(iid)
+                continue
+            if any(not decision.source.exists() for decision in group):
+                self._log(f"跳过：源文件不存在：{self.rows[iid]}")
+                skipped += 1
+            elif any(decision.status == "conflict" for decision in group):
+                self._log(f"跳过同组文件的改名冲突：{self.rows[iid]}")
+                skipped += 1
             else:
+                applied = []
                 try:
-                    if decision.target.exists():
-                        raise FileExistsError("目标文件已存在")
-                    decision.source.rename(decision.target)
+                    for decision in group:
+                        if decision.status != "rename":
+                            continue
+                        if decision.target.exists():
+                            raise FileExistsError(f"目标文件已存在：{decision.target}")
+                        decision.source.rename(decision.target)
+                        applied.append(decision)
                 except OSError as exc:
-                    self._log(f"改名失败：{decision.source}：{exc}")
+                    self._log(f"改名失败：{self.rows[iid]}：{exc}")
+                    for decision in reversed(applied):
+                        try:
+                            decision.target.rename(decision.source)
+                        except OSError as rollback_exc:
+                            self._log(f"改名回滚失败：{decision.target}：{rollback_exc}")
                     skipped += 1
                 else:
-                    self.rows[iid] = decision.target
-                    self._log(f"已改名：{decision.source.name} → {decision.target.name}")
+                    changed = {decision.source: decision.target for decision in applied}
+                    for row, path in list(self.rows.items()):
+                        if path in changed:
+                            self.rows[row] = changed[path]
+                    for decision in applied:
+                        self._log(f"已改名：{decision.source.name} → {decision.target.name}")
+                    processed.update(decision.source for decision in group)
                     ready.append(iid)
-                    renamed += 1
+                    renamed += len(applied)
         self._refresh_preview()
         self.status.set(f"改名完成：成功 {renamed}，跳过/失败 {skipped}。")
         return ready, skipped
@@ -527,22 +585,102 @@ class ArchiveApp:
         if output_root is not None and output_root.exists() and not output_root.is_dir():
             messagebox.showerror("目标目录无效", f"解压目标不是文件夹：{output_root}")
             return False
-        selected_folders = [self.rows[iid] for iid in selected if iid in self.folder_archives]
-        file_iids = [iid for iid in selected if iid not in self.folder_archives and not any(
-            self.rows[iid].is_relative_to(folder) for folder in selected_folders
-        )]
-        decisions = dict(zip(file_iids, plan_renames([self.rows[iid] for iid in file_iids], self.rename_suffix.get())))
-        for iid in file_iids:
-            decision = decisions[iid]
-            candidate = decision.target if decision.status == "rename" else decision.source
-            base = extraction_base(candidate)
-            if base is None:
-                continue
-            destination = (output_root or candidate.parent) / f"{base}_解压"
-            if destination.exists() or is_linked_path(destination):
-                messagebox.showerror("目标目录已存在", f"避免覆盖，解压前请处理已有目录：{destination}")
-                return False
+        plan = plan_batch([self.rows[iid] for iid in selected], output_root, rename=True,
+                          target_suffix=self.rename_suffix.get(),
+                          recursive=self.recursive.get() if hasattr(self, "recursive") else True)
+        if plan.issues:
+            messagebox.showerror("预检发现问题", "\n".join(plan.issues[:10]))
+            return False
         return True
+
+    def _preview_selected(self) -> None:
+        selected = self._selected()
+        if not selected:
+            return
+        output = self.output_dir.get().strip()
+        plan = plan_batch([self.rows[iid] for iid in selected], Path(output).expanduser() if output else None,
+                          rename=True, target_suffix=self.rename_suffix.get(), recursive=self.recursive.get())
+        window = tk.Toplevel(self.root)
+        window.title("预检：改名与解压计划")
+        window.geometry("1000x500")
+        window.transient(self.root)
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        frame.rowconfigure(1, weight=1)
+        frame.columnconfigure(0, weight=1)
+        changed = {decision.source for item in plan.items for decision in item.renames if decision.status == "rename"}
+        text = (f"解压任务 {len(plan.jobs)} 个，待改名文件 {len(changed)} 个，"
+                f"来源压缩文件共 {plan.input_bytes / (1024 * 1024):.2f} MiB，发现问题 {len(plan.issues)} 个。")
+        ttk.Label(frame, text=text, wraplength=960).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        table = ttk.Treeview(frame, columns=("source", "target", "status"), show="headings")
+        for column, label, width in (("source", "来源", 300), ("target", "最终结果位置", 350), ("status", "检查结果", 280)):
+            table.heading(column, text=label)
+            table.column(column, width=width)
+        table.grid(row=1, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=table.yview)
+        scroll.grid(row=1, column=1, sticky="ns")
+        table.configure(yscrollcommand=scroll.set)
+        for item in plan.items:
+            table.insert("", "end", values=(str(item.source), str(item.destination or "—"),
+                         "；".join(item.issues) or item.note or "可以处理"))
+        notes = "\n".join(plan.issues) if plan.issues else "未发现已知冲突；实际密码、数据完整性和所需解压空间仍由解压结果确认。"
+        details = tk.Text(frame, height=4, wrap="word")
+        details.grid(row=2, column=0, sticky="ew", pady=8)
+        details.insert("1.0", notes)
+        details.configure(state="disabled")
+        note_scroll = ttk.Scrollbar(frame, orient="vertical", command=details.yview)
+        note_scroll.grid(row=2, column=1, sticky="ns", pady=8)
+        details.configure(yscrollcommand=note_scroll.set)
+        ttk.Label(frame, text="预检只读取文件。选择首卷改名会自动处理同组分卷；文件大小是源包大小。",
+                  wraplength=960).grid(row=3, column=0, sticky="ew")
+        ttk.Button(frame, text="关闭", command=window.destroy).grid(row=4, column=0, sticky="e", pady=(8, 0))
+
+    def _set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        for widget in self.action_buttons + self.file_buttons + self.config_widgets:
+            widget.state(["disabled"] if busy else ["!disabled"])
+        self.cancel_button.configure(state="normal" if busy else "disabled")
+
+    def _cancel_batch(self) -> None:
+        if self.busy:
+            self.cancel_event.set()
+            self.cancel_button.configure(state="disabled")
+            self.status.set("正在取消；等待解压进程停止，保留未完成任务的源包和临时内容。")
+
+    def _retry_failed(self) -> None:
+        selected = [iid for iid, outcome in self.outcomes.items() if outcome.status in {"failed", "cancelled"} and iid in self.rows]
+        if selected:
+            self.table.selection_set(selected)
+            self._start_extract(selected)
+        else:
+            self.status.set("没有失败或取消的任务需要重试。")
+
+    def _open_results(self) -> None:
+        selected = list(self.table.selection()) or list(self.outcomes)
+        paths = list(dict.fromkeys(self.outcomes[iid].destination for iid in selected
+                                  if iid in self.outcomes and self.outcomes[iid].destination is not None))
+        if not paths:
+            self.status.set("所选项目还没有已交付的结果。")
+        for path in paths:
+            try:
+                if not path.is_dir():
+                    raise FileNotFoundError(f"结果目录不存在：{path}")
+                os.startfile(path)
+            except OSError as exc:
+                self._log(f"无法打开结果目录：{exc}")
+
+    def _export_log(self) -> None:
+        destination = filedialog.asksaveasfilename(title="导出操作日志", defaultextension=".txt",
+                                                  initialfile="ArchiveFixer-log.txt", filetypes=[("文本", "*.txt")])
+        if destination:
+            try:
+                secrets = self.session_secrets | {variable.get() for variable in self.password_vars}
+                text = redact_secrets(self.log.get("1.0", "end-1c"), secrets)
+                Path(destination).write_text(f"ArchiveFixer v{VERSION}\n{text}\n", encoding="utf-8")
+            except OSError as exc:
+                messagebox.showerror("导出失败", str(exc))
+            else:
+                self.status.set(f"操作日志已导出：{destination}")
 
     def _start_extract(self, selected: list[str]) -> None:
         if not self._validate_folder_selection(selected):
@@ -560,38 +698,29 @@ class ArchiveApp:
         if not 1 <= max_concurrent <= 8:
             messagebox.showerror("任务数无效", "同时解压任务数请输入 1 到 8。")
             return
-        jobs = []
-        selected_folders = [self.rows[iid] for iid in selected if iid in self.folder_archives]
-        for iid in selected:
-            path = self.rows[iid]
-            if iid in self.folder_archives:
-                try:
-                    archives = tuple(discover_archive_inputs(path, self.recursive.get()))
-                except ExtractionError as exc:
-                    messagebox.showerror("文件夹扫描失败", str(exc))
-                    return
-                if not archives:
-                    messagebox.showerror("没有压缩包", f"文件夹中未找到可识别的压缩包：{path}")
-                    return
-                self.folder_archives[iid] = archives
-                jobs.append(ExtractionJob(path, path.name, folder_mode=True, archives=archives))
-                continue
-            if any(path.is_relative_to(folder) for folder in selected_folders):
-                self._log(f"文件已由所选文件夹任务包含，避免重复解压：{path}")
-                continue
-            base = extraction_base(path)
-            if base is None:
-                self._log(f"跳过解压：请先改名，或当前文件不是可识别的压缩包首卷：{path.name}")
-                continue
-            jobs.append(ExtractionJob(path, base))
+        plan = plan_batch([self.rows[iid] for iid in selected], output_root, recursive=self.recursive.get())
+        if plan.issues:
+            messagebox.showerror("预检发现问题", "\n".join(plan.issues[:10]))
+            return
+        jobs = list(plan.jobs)
+        for item in plan.items:
+            if item.source.is_dir():
+                for iid in selected:
+                    if self.rows[iid] == item.source:
+                        self.folder_archives[iid] = item.files
         if not jobs:
             self.status.set("没有可解压的压缩包；分卷只从 .001 首卷解压。")
             return
-        self.busy = True
-        for button in self.action_buttons + self.file_buttons:
-            button.configure(state="disabled")
+        self.cancel_event = threading.Event()
+        self.finished_sources.clear()
+        for iid in selected:
+            self.row_statuses.pop(iid, None)
+            self.outcomes.pop(iid, None)
+        self.progress_bar.configure(maximum=len(jobs), value=0)
+        self._set_busy(True)
         self.status.set(f"正在处理 {len(jobs)} 个任务，同时最多 {max_concurrent} 个…")
         passwords = tuple(variable.get() for variable in self.password_vars)
+        self.session_secrets.update(password for password in passwords if password)
         thread = threading.Thread(
             target=self._extract_worker,
             args=(executable, backend, jobs, output_root, passwords, self.delete_archives.get(), max_concurrent),
@@ -609,7 +738,8 @@ class ArchiveApp:
         delete_archives: bool,
         max_concurrent: int,
     ) -> None:
-        engine = ExtractionEngine(executable, passwords, lambda message: self.events.put(("log", message)), backend)
+        engine = ExtractionEngine(executable, passwords, lambda message: self.events.put(("log", message)), backend,
+                                  self.cancel_event, lambda update: self.events.put(("progress", update)))
         try:
             result = engine.run(jobs, output_root, delete_archives, max_concurrent)
         except ExtractionError as exc:
@@ -628,15 +758,16 @@ class ArchiveApp:
                 self.events.put(("log", f"清理提示：{warning}"))
             summary = (
                 f"完成：成功 {result.successful_jobs}/{result.outer_archives} 个任务，"
-                f"失败 {result.failed_jobs} 个，清理提示 {len(result.warnings)} 个，累计 {result.layers} 层，"
+                f"失败 {result.failed_jobs} 个，取消 {result.cancelled_jobs} 个，清理提示 {len(result.warnings)} 个，累计 {result.layers} 层，"
                 f"最终文件 {result.final_files} 个，删除压缩包文件 {result.deleted_archives} 个。"
             )
             self.events.put(("log", summary))
+            self.events.put(("result", result))
             self.events.put(("done", summary))
 
     def _close(self) -> None:
         if self.busy:
-            messagebox.showinfo("正在解压", "请等待本批次解压及清理完成后再关闭窗口。")
+            messagebox.showinfo("正在解压", "请等待本批次完成后关闭；也可点击“取消本批次”，等待解压进程停止后关闭。")
             return
         self.root.after_cancel(self._event_poller)
         self.root.destroy()
@@ -647,10 +778,31 @@ class ArchiveApp:
                 kind, message = self.events.get_nowait()
                 if kind == "log":
                     self._log(message)
+                elif kind == "progress":
+                    labels = {"queued": "等待处理", "running": "正在处理", "extracting": "正在解压",
+                              "organizing": "整理结果", "cleaning": "清理压缩层", "success": "完成",
+                              "warning": "完成（清理提示）", "failed": "失败", "cancelled": "已取消"}
+                    state = labels[message.state]
+                    if message.layer:
+                        state = f"第 {message.layer} 层，尝试密码 {message.password_index}"
+                    for iid, path in self.rows.items():
+                        if path == message.source:
+                            self.row_statuses[iid] = state
+                            values = list(self.table.item(iid, "values"))
+                            values[2] = state
+                            self.table.item(iid, values=values)
+                    if message.state in {"success", "warning", "failed", "cancelled"}:
+                        self.finished_sources.add(message.source)
+                        self.progress_bar.configure(value=len(self.finished_sources))
+                    if not self.cancel_event.is_set():
+                        self.status.set(f"已处理 {len(self.finished_sources)}/{int(self.progress_bar['maximum'])} 个任务；{message.source.name}：{state}")
+                elif kind == "result":
+                    for outcome in message.outcomes:
+                        for iid, path in self.rows.items():
+                            if path == outcome.source:
+                                self.outcomes[iid] = outcome
                 elif kind == "done":
-                    self.busy = False
-                    for button in self.action_buttons + self.file_buttons:
-                        button.configure(state="normal")
+                    self._set_busy(False)
                     self._refresh_preview()
                     self.status.set(message)
         except Empty:

@@ -42,7 +42,7 @@ class ReliabilityTests(unittest.TestCase):
             source.write_bytes(b"archive")
             attempts = []
 
-            def run(args, **kwargs):
+            def run(engine, args):
                 destination = Path(next(arg[2:] for arg in args if arg.startswith("-o")))
                 attempts.append(destination)
                 payload = destination / "payload.txt"
@@ -53,7 +53,7 @@ class ReliabilityTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, "", "")
 
             engine = ExtractionEngine(Path("7z.exe"), ["wrong", "correct"], lambda message: None)
-            with patch("archive_engine.subprocess.run", run):
+            with patch.object(ExtractionEngine, "_run_command", run):
                 result = engine.run([ExtractionJob(source, "sample")], None, True)
             self.assertEqual((result.successful_jobs, result.failed_jobs), (1, 0))
             self.assertEqual(len(attempts), 2)

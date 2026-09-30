@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from threading import Event
 import os
 from pathlib import Path
 import re
@@ -16,6 +17,7 @@ from uuid import uuid4
 
 from archive_extractors import EXTRACTOR_LABELS, extraction_command, output_encoding
 from archive_logic import volume_part
+from archive_reports import redact_secrets
 
 
 ARCHIVE_HINT = re.compile(r"(?i)\.(?:7z|shan7z|7shanz|7zshan|zip|rar|tar|gz|bz2|xz|cab|iso|wim)(?=\.|$)")
@@ -32,8 +34,16 @@ class ExtractionError(Exception):
     """Extraction did not finish; no archive cleanup has started."""
 
 
+class ExtractionCancelled(ExtractionError):
+    """User cancelled an uncommitted job; source archives remain intact."""
+
+
 class CleanupError(Exception):
     """All layers extracted, but archive cleanup was incomplete."""
+
+    def __init__(self, message: str, *, deleted_archives: int = 0) -> None:
+        super().__init__(message)
+        self.deleted_archives = deleted_archives
 
 
 @dataclass(frozen=True)
@@ -61,6 +71,25 @@ class BatchResult:
     failed_jobs: int = 0
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
+    cancelled_jobs: int = 0
+    outcomes: tuple[JobOutcome, ...] = ()
+
+
+@dataclass(frozen=True)
+class JobProgress:
+    source: Path
+    state: str
+    layer: int = 0
+    password_index: int = 0
+
+
+@dataclass(frozen=True)
+class JobOutcome:
+    source: Path
+    status: str
+    destination: Path | None = None
+    detail: str = ""
+    retained_paths: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -123,6 +152,13 @@ def is_linked_path(path: Path) -> bool:
     return path.is_symlink() or path.is_junction()
 
 
+def is_managed_artifact_dir(path: Path) -> bool:
+    return path.name.startswith((".archive_work_", ".archive_stage_", ".archive_attempt_",
+                                 ".archive_flat_stage_", ".archive_flat_backup_")) or bool(
+        re.search(r"_压缩层备份(?:_\d+)?$", path.name)
+    )
+
+
 def _is_terminal_container(path: Path) -> bool:
     return path.suffix.casefold() in TERMINAL_CONTAINER_SUFFIXES and not ARCHIVE_HINT.search(path.name)
 
@@ -150,6 +186,8 @@ def discover_archive_inputs(folder: Path, recursive: bool = True) -> list[Path]:
     """
     if is_linked_path(folder):
         raise ExtractionError(f"拒绝扫描链接目录：{folder}")
+    if is_managed_artifact_dir(folder):
+        raise ExtractionError(f"工具临时目录和压缩层备份不参加自动扫描；请从原始任务重试，或直接添加需要恢复的压缩文件：{folder}")
     if recursive:
         try:
             direct_files = [path for path in folder.iterdir() if path.is_file() and not is_linked_path(path)]
@@ -165,7 +203,7 @@ def discover_archive_inputs(folder: Path, recursive: bool = True) -> list[Path]:
             return []
         files = []
         for root, dirs, names in os.walk(folder, onerror=_walk_error):
-            dirs[:] = [name for name in dirs if not is_linked_path(Path(root) / name)]
+            dirs[:] = [name for name in dirs if not is_linked_path(Path(root) / name) and not is_managed_artifact_dir(Path(root) / name)]
             files.extend(Path(root) / name for name in names)
     else:
         try:
@@ -197,7 +235,7 @@ def expand_dropped_folder(folder: Path, recursive: bool = True) -> list[Path]:
     except OSError as exc:
         raise ExtractionError(f"无法读取文件夹：{folder}：{exc}") from exc
     for child in children:
-        if child.is_dir() and not is_linked_path(child) and discover_archive_inputs(child, recursive=recursive):
+        if child.is_dir() and not is_linked_path(child) and not is_managed_artifact_dir(child) and discover_archive_inputs(child, recursive=recursive):
             child_folders.append(child)
     if direct_archives and child_folders:
         return sorted(direct_archives + child_folders, key=lambda path: str(path).casefold())
@@ -307,7 +345,24 @@ def _volume_group(first: Path) -> list[Path]:
     return sorted(group, key=lambda path: volume_part(path.name)[1])
 
 
+def validate_volume_group(first: Path) -> None:
+    """Detect duplicate and missing numbered parts, without changing files."""
+    if volume_part(first.name) is None:
+        return
+    group = _volume_group(first)
+    numbers = [volume_part(path.name)[1] for path in group]
+    if len(numbers) != len(set(numbers)):
+        raise ExtractionError(f"同一组分卷出现重复编号：{first.parent}：{first.name}")
+    if numbers:
+        missing = sorted(set(range(1, max(numbers) + 1)) - set(numbers))
+        if missing:
+            width = _volume_width(first)
+            labels = ", ".join(f".{number:0{width}d}" for number in missing[:10])
+            raise ExtractionError(f"分卷不完整，缺少 {labels}：{first.name}")
+
+
 def _normalize_volume_group(first: Path) -> Path:
+    validate_volume_group(first)
     group = _volume_group(first)
     targets = [path.with_name(path.name[: volume_part(path.name)[0]]) for path in group]
     folded = [str(path).casefold() for path in targets]
@@ -439,6 +494,9 @@ class ExtractionEngine:
         passwords: str | Sequence[str],
         log: Callable[[str], None],
         backend: str = "7zip",
+        cancel_event: Event | None = None,
+        progress: Callable[[JobProgress], None] | None = None,
+        job_source: Path | None = None,
     ) -> None:
         if backend not in EXTRACTOR_LABELS:
             raise ValueError(f"不支持的解压程序：{backend}")
@@ -448,6 +506,55 @@ class ExtractionEngine:
         self.passwords = tuple(supplied) if any(supplied) else ("",)
         self.log = log
         self.layers: list[Layer] = []
+        self.cancel_event = cancel_event or Event()
+        self.progress = progress or (lambda update: None)
+        self.job_source = job_source
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise ExtractionCancelled("任务已取消；源压缩包和未提交的临时内容已保留。")
+
+    def _notify(self, source: Path, state: str, layer: int = 0, password_index: int = 0) -> None:
+        self.progress(JobProgress(self.job_source or source, state, layer, password_index))
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen) -> None:
+        if process.poll() is None:
+            if os.name == "nt":
+                try:
+                    subprocess.run(
+                        [str(Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "taskkill.exe"),
+                         "/PID", str(process.pid), "/T", "/F"],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), timeout=5, check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if process.poll() is None:
+                process.kill()
+        process.communicate(timeout=5)
+
+    def _run_command(self, args: list[str]) -> subprocess.CompletedProcess:
+        # Note: .agents/notes/implemented/feature/2026-09-30-batch-control-and-preview.md
+        self._check_cancelled()
+        process = subprocess.Popen(
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding=output_encoding(self.backend), errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            while True:
+                if self.cancel_event.is_set():
+                    self._stop_process(process)
+                    self._check_cancelled()
+                try:
+                    stdout, stderr = process.communicate(timeout=0.15)
+                    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if process.poll() is None:
+                self._stop_process(process)
 
     def run(
         self,
@@ -497,7 +604,10 @@ class ExtractionEngine:
         workdirs: dict[Path, Path] = {}
 
         def process_one(spec: ExtractionJob) -> JobResult:
-            worker = ExtractionEngine(self.executable, self.passwords, self.log, self.backend)
+            self._check_cancelled()
+            worker = ExtractionEngine(self.executable, self.passwords, self.log, self.backend,
+                                      self.cancel_event, self.progress, spec.source)
+            worker._notify(spec.source, "running")
             parent = spec.source.parent if spec.folder_mode else (output_root or spec.source.parent)
             try:
                 parent.mkdir(parents=True, exist_ok=True)
@@ -508,6 +618,7 @@ class ExtractionEngine:
             branches: list[BranchResult] = []
             if spec.folder_mode:
                 for archive in spec.archives:
+                    worker._check_cancelled()
                     part = volume_part(archive.name)
                     if part and part[1] != 1:
                         prefix = _volume_prefix(archive)
@@ -531,8 +642,13 @@ class ExtractionEngine:
                 branches.append(BranchResult(destination, tuple(worker.layers)))
             return JobResult(spec.source, spec.base, parent, workdir, spec.folder_mode, tuple(branches))
 
-        errors = []
-        results: list[JobResult] = []
+        errors: list[str] = []
+        warnings: list[str] = []
+        outcomes: list[JobOutcome] = []
+        completed: list[JobResult] = []
+        final_files = deleted = cancelled = 0
+        for spec in specs:
+            self._notify(spec.source, "queued")
         with ThreadPoolExecutor(max_workers=min(max_concurrent, len(jobs))) as pool:
             futures = {pool.submit(process_one, spec): spec.source for spec in specs}
             for future in as_completed(futures):
@@ -540,60 +656,84 @@ class ExtractionEngine:
                 try:
                     result = future.result()
                 except Exception as exc:
-                    errors.append(f"{source.name}：{exc}")
+                    was_cancelled = isinstance(exc, ExtractionCancelled)
+                    if was_cancelled:
+                        cancelled += 1
+                    else:
+                        errors.append(f"{source.name}：{exc}")
                     workdir = workdirs.get(source)
-                    if workdir is not None and workdir.exists():
+                    retained = (workdir,) if workdir is not None and workdir.exists() else ()
+                    if retained:
                         self.log(f"失败任务的工作目录已保留，可检查后手动清理：{workdir}")
+                    state = "cancelled" if was_cancelled else "failed"
+                    outcomes.append(JobOutcome(source, state, detail=str(exc), retained_paths=retained))
+                    self._notify(source, state)
                 else:
-                    results.append(result)
-
-        completed: list[JobResult] = []
-        warnings: list[str] = []
-        final_files = 0
-        deleted = 0
-        for result in results:
-            stage: Path | None = None
-            try:
-                stage = Path(tempfile.mkdtemp(prefix=".archive_stage_", dir=result.parent))
-                staged_files = self._stage_final_content(result, stage)
-                if delete_archives:
-                    self._verify_archive_snapshots(result.layers)
-                if result.folder_mode:
-                    self._check_folder_stage_merge(stage, result.source)
-                final_path = result.source if result.folder_mode else result.parent / f"{result.base}_解压"
-                if result.folder_mode:
-                    self._merge_stage_into_folder(stage, final_path, result.parent)
-                else:
-                    self._rename_owned_directory(stage, final_path, result.parent)
-                self.log(f"最终内容已整理到：{final_path}")
-            except Exception as exc:
-                errors.append(f"{result.source.name}：{exc}")
-                for temporary in (result.workdir, stage):
-                    if temporary is not None and temporary.exists():
-                        self.log(f"任务未完整完成，暂存目录已保留供检查：{temporary}")
-            else:
-                completed.append(result)
-                final_files += staged_files
-                # Once the result is committed, a cleanup failure cannot undo it.
-                if result.folder_mode:
-                    try:
-                        stage.rmdir()
-                    except OSError as exc:
-                        warning = f"{result.source.name}：最终内容已交付，但空暂存目录未清理：{stage}：{exc}"
-                        warnings.append(warning)
-                        self.log(warning)
-                try:
-                    deleted += self._cleanup_workdirs([result], delete_archives)
-                except Exception as exc:
-                    warning = f"{result.source.name}：最终内容已交付，但压缩层清理未完成：{exc}"
-                    warnings.append(warning)
-                    self.log(warning)
+                    outcome, count, removed, notes = self._finalize_job(result, delete_archives)
+                    outcomes.append(outcome)
+                    warnings.extend(notes)
+                    final_files += count
+                    deleted += removed
+                    if outcome.status in {"success", "warning"}:
+                        completed.append(result)
+                    elif outcome.status == "cancelled":
+                        cancelled += 1
+                    else:
+                        errors.append(f"{source.name}：{outcome.detail}")
+                    self._notify(source, outcome.status)
 
         self.layers = [layer for result in completed for layer in result.layers]
         return BatchResult(
             len(jobs), len(self.layers), final_files, deleted,
-            len(completed), len(errors), tuple(errors), tuple(warnings),
+            len(completed), len(errors), tuple(errors), tuple(warnings), cancelled, tuple(outcomes),
         )
+
+    def _finalize_job(self, result: JobResult, delete_archives: bool) -> tuple[JobOutcome, int, int, tuple[str, ...]]:
+        stage: Path | None = None
+        try:
+            self._check_cancelled()
+            self._notify(result.source, "organizing")
+            stage = Path(tempfile.mkdtemp(prefix=".archive_stage_", dir=result.parent))
+            staged_files = self._stage_final_content(result, stage)
+            if delete_archives:
+                self._verify_archive_snapshots(result.layers)
+            self._check_cancelled()
+            final_path = result.source if result.folder_mode else result.parent / f"{result.base}_解压"
+            # Directory commit is a short transaction; cancellation resumes afterward.
+            if result.folder_mode:
+                self._merge_stage_into_folder(stage, final_path, result.parent)
+            else:
+                self._rename_owned_directory(stage, final_path, result.parent)
+            self.log(f"最终内容已整理到：{final_path}")
+        except Exception as exc:
+            retained = tuple(path for path in (result.workdir, stage) if path is not None and path.exists())
+            for path in retained:
+                self.log(f"任务未完整完成，暂存目录已保留供检查：{path}")
+            state = "cancelled" if isinstance(exc, ExtractionCancelled) else "failed"
+            return JobOutcome(result.source, state, detail=str(exc), retained_paths=retained), 0, 0, ()
+
+        warnings: list[str] = []
+        deleted = 0
+        self._notify(result.source, "cleaning")
+        if result.folder_mode:
+            try:
+                stage.rmdir()
+            except OSError as exc:
+                warnings.append(f"{result.source.name}：最终内容已交付，但空暂存目录未清理：{stage}：{exc}")
+        try:
+            if self.cancel_event.is_set() and delete_archives:
+                warnings.append(f"{result.source.name}：结果已交付；收到取消请求，保留原始压缩包和压缩层备份。")
+                delete_archives = False
+            deleted = self._cleanup_workdirs([result], delete_archives)
+        except Exception as exc:
+            deleted += getattr(exc, "deleted_archives", 0)
+            warnings.append(f"{result.source.name}：最终内容已交付，但压缩层清理未完成：{exc}")
+        for warning in warnings:
+            self.log(warning)
+        retained = tuple(path for path in (result.workdir, stage) if path.exists())
+        outcome = JobOutcome(result.source, "warning" if warnings else "success", final_path,
+                             "；".join(warnings), retained)
+        return outcome, staged_files, deleted, tuple(warnings)
 
     @staticmethod
     def _mapped_relative(path: Path, root: Path, wrappers: set[Path]) -> Path:
@@ -606,6 +746,7 @@ class ExtractionEngine:
         return Path(*retained)
 
     def _stage_final_content(self, result: JobResult, stage: Path) -> int:
+        self._check_cancelled()
         payload: list[tuple[Path, Path, int]] = []
         empty_dirs: list[tuple[Path, int]] = []
         for branch_index, branch in enumerate(result.branches):
@@ -669,6 +810,7 @@ class ExtractionEngine:
             if relative != Path(".") and str(relative).casefold() not in file_keys:
                 (stage / relative).mkdir(parents=True, exist_ok=True)
         for source, relative, _ in payload:
+            self._check_cancelled()
             destination = stage / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             if destination.exists() or is_linked_path(destination):
@@ -791,14 +933,16 @@ class ExtractionEngine:
                 self.log(f"压缩层已保留在：{backup}")
             return 0
 
-        deleted = len({
-            snapshot.path
-            for result in results
-            for layer in result.layers
-            for snapshot in layer.archive_files
-        })
+        deleted = 0
         for result in results:
-            self._remove_owned_workdir(result.workdir, result.parent)
+            nested_archives = {snapshot.path for layer in result.layers for snapshot in layer.archive_files
+                               if snapshot.path.is_relative_to(result.workdir)}
+            try:
+                self._remove_owned_workdir(result.workdir, result.parent)
+            except CleanupError as exc:
+                removed = sum(not path.exists() for path in nested_archives)
+                raise CleanupError(str(exc), deleted_archives=deleted + removed) from exc
+            deleted += len(nested_archives)
         root_archives = {
             snapshot.path: snapshot
             for result in results
@@ -806,16 +950,19 @@ class ExtractionEngine:
             for snapshot in branch.layers[0].archive_files
         }
         for snapshot in root_archives.values():
+            if self.cancel_event.is_set():
+                raise CleanupError("收到取消请求，停止删除尚未清理的原始压缩包。", deleted_archives=deleted)
             try:
                 stat = snapshot.path.stat()
             except OSError as exc:
-                raise CleanupError(f"原始压缩包不可用：{snapshot.path}：{exc}") from exc
+                raise CleanupError(f"原始压缩包不可用：{snapshot.path}：{exc}", deleted_archives=deleted) from exc
             if (stat.st_size, stat.st_mtime_ns) != (snapshot.size, snapshot.mtime_ns):
-                raise CleanupError(f"原始压缩包在整理期间发生变化：{snapshot.path}")
+                raise CleanupError(f"原始压缩包在整理期间发生变化：{snapshot.path}", deleted_archives=deleted)
             try:
                 snapshot.path.unlink()
             except OSError as exc:
-                raise CleanupError(f"最终内容已保留，但删除原始压缩包失败：{snapshot.path}：{exc}") from exc
+                raise CleanupError(f"最终内容已保留，但删除原始压缩包失败：{snapshot.path}：{exc}", deleted_archives=deleted) from exc
+            deleted += 1
             self.log(f"已删除原始压缩包：{snapshot.path}")
         for result in results:
             if not result.folder_mode:
@@ -832,6 +979,7 @@ class ExtractionEngine:
         return deleted
 
     def _expand(self, source: Path, base: str, parent: Path, number: int) -> Path:
+        self._check_cancelled()
         if number > MAX_LAYERS:
             raise ExtractionError(f"超过 {MAX_LAYERS} 层压缩包：{source}")
         if is_linked_path(source) or not source.is_file():
@@ -840,12 +988,18 @@ class ExtractionEngine:
         if destination.exists():
             raise ExtractionError(f"解压目录已存在，避免覆盖：{destination}")
 
+        validate_volume_group(source)
         snapshots = _archive_files(source)
         self.log(f"第 {number} 层：{source.name} → {destination}")
         last_error = ""
+        attempted_passwords: set[str] = set()
         for index, password in enumerate(self.passwords, start=1):
+            self._check_cancelled()
             if not password and any(self.passwords):
                 continue
+            if password in attempted_passwords:
+                continue
+            attempted_passwords.add(password)
             try:
                 attempt = Path(tempfile.mkdtemp(prefix=".archive_attempt_", dir=parent))
             except OSError as exc:
@@ -853,21 +1007,13 @@ class ExtractionEngine:
             error_log = parent / f".archive_diagnostic_{uuid4().hex}.log" if self.backend == "winrar" else None
             args = extraction_command(self.backend, self.executable, source, attempt, password, error_log)
             self.log(f"第 {number} 层尝试预设密码 {index}/{len(self.passwords)}：{source.name}")
+            self._notify(source, "extracting", number, index)
             try:
-                command = subprocess.run(
-                    args,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding=output_encoding(self.backend),
-                    errors="replace",
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                    check=False,
-                )
+                command = self._run_command(args)
             except OSError as exc:
                 self._remove_attempt(attempt, parent)
                 raise ExtractionError(f"无法启动 {EXTRACTOR_LABELS[self.backend]}：{exc}") from exc
+            self._check_cancelled()
             diagnostic = ""
             if error_log is not None and error_log.exists():
                 try:
@@ -889,9 +1035,7 @@ class ExtractionEngine:
             last_error = " | ".join(lines[-4:]) if lines else (
                 f"退出码 {command.returncode}" if command.returncode else "解压程序未产生内容；请检查密码或压缩包"
             )
-            for secret in self.passwords:
-                if secret:
-                    last_error = last_error.replace(secret, "[已隐藏]")
+            last_error = redact_secrets(last_error, self.passwords)
             self._remove_attempt(attempt, parent)
         else:
             raise ExtractionError(f"第 {number} 层所有预设密码均未成功：{source.name}：{last_error}")
